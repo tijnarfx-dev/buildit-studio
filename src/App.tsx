@@ -15,6 +15,7 @@ function App() {
   return (
     <main className="container">
       <h1>Welcome to Tauri + React</h1>
+      <h1 className="border bg-slate-200">Tailwind CSS</h1>
 
       <div className="row">
         <a href="https://vite.dev" target="_blank">
