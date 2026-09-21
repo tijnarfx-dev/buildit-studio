@@ -1,51 +1,33 @@
+// src/App.tsx
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { Canvas } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import { TerrainScene } from "./components/TerrainScene";
 import "./App.css";
 
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
-
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+  const [zoom, setZoom] = useState(11);
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-      <h1 className="border bg-slate-200">Tailwind CSS</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+    <div style={{ width: "100vw", height: "100vh", position: "relative" }}>
+      <div style={{ position: "absolute", top: 12, left: 12, zIndex: 10, background: "#fff", padding: 8, borderRadius: 6 }}>
+        <label>
+          Zoom:&nbsp;
+          <select value={zoom} onChange={(e) => setZoom(Number(e.target.value))}>
+            {[10, 11, 12, 13].map((z) => <option key={z} value={z}>{z}</option>)}
+          </select>
+        </label>
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
 
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
+      <Canvas
+        camera={{ position: [0, 4000, 4000], fov: 50, near: 10, far: 50_000 }}
       >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
-        />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+        <ambientLight intensity={0.7} />
+        <directionalLight position={[5000, 10_000, 5000]} intensity={1.3} />
+        <TerrainScene zoom={zoom} />
+        <OrbitControls target={[0, 800, 0]} />
+      </Canvas>
+    </div>
   );
 }
 
