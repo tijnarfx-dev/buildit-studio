@@ -1,7 +1,0 @@
-Analysis complete! Output written to: digest.txt
-
-Summary:
-Directory: buildit-studio
-Files analyzed: 22
-
-Estimated tokens: 3.8k

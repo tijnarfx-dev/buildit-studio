@@ -2,9 +2,9 @@ Directory structure:
 └── buildit-studio/
     ├── README.md
     ├── index.html
+    ├── inspect_tile.py
     ├── package.json
     ├── postcss.config.mjs
-    ├── repo.txt
     ├── tsconfig.json
     ├── tsconfig.node.json
     ├── vite.config.ts
@@ -13,7 +13,15 @@ Directory structure:
     │   ├── App.css
     │   ├── App.tsx
     │   ├── main.tsx
-    │   └── vite-env.d.ts
+    │   ├── vite-env.d.ts
+    │   ├── components/
+    │   │   ├── Terrain.tsx
+    │   │   ├── TerrainScene.tsx
+    │   │   └── TerrainTile.tsx
+    │   └── lib/
+    │       ├── addSkirts.ts
+    │       ├── quantizedMesh.ts
+    │       └── tileMath.ts
     └── src-tauri/
         ├── build.rs
         ├── Cargo.toml
@@ -22,10 +30,6 @@ Directory structure:
         │   └── default.json
         ├── icons/
         │   └── icon.icns
-        ├── resources/
-        │   └── terrain/
-        │       └── srtm_tiles/
-        │           └── tileset.json
         └── src/
             ├── lib.rs
             ├── main.rs
@@ -65,6 +69,18 @@ FILE: index.html
 
 
 ================================================
+FILE: inspect_tile.py
+================================================
+import gzip, sys
+p = r"src-tauri\resources\terrain\srtm_tiles\11\3120\1313.terrain"
+with gzip.open(p, "rb") as f:
+    data = f.read()
+print(f"length: {len(data)}")
+print(f"first 32 bytes (ascii): {data[:32]!r}")
+print(f"first 32 bytes (hex):   {data[:32].hex(' ')}")
+
+
+================================================
 FILE: package.json
 ================================================
 {
@@ -79,18 +95,22 @@ FILE: package.json
     "tauri": "tauri"
   },
   "dependencies": {
+    "@react-three/drei": "^10.7.8",
+    "@react-three/fiber": "^9.7.0",
     "@tailwindcss/postcss": "^4.3.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@types/three": "^0.186.0",
     "postcss": "^8.5.28",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0",
-    "tailwindcss": "^4.3.3"
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "tailwindcss": "^4.3.3",
+    "three": "^0.186.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "@types/react": "^19.1.8",
-    "@types/react-dom": "^19.1.6",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "~6.0.3",
     "vite": "^8.0.16"
@@ -107,12 +127,6 @@ export default {
     "@tailwindcss/postcss": {},
   }
 }
-
-
-================================================
-FILE: repo.txt
-================================================
-[Empty file]
 
 
 ================================================
@@ -203,6 +217,7 @@ export default defineConfig(() => ({
 ================================================
 FILE: .gitingestignore
 ================================================
+src-tauri/resources/terrain/
 resources/terrain/
 
 
@@ -334,59 +349,72 @@ button {
 ================================================
 FILE: src/App.tsx
 ================================================
+// src/App.tsx
+import * as THREE from "three";
 import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { Canvas } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import { TerrainScene } from "./components/TerrainScene";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
-  }
+function App() {
+  const [zoom, setZoom] = useState(11);
+
+  const SKY_COLOR = "#b8d4e8";       // pale blue
+  const FOG_NEAR = 15_000;            // start fading at 8 km
+  const FOG_FAR = 60_000;            // fully fogged at 20 km (= cull radius)
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-      <h1 className="border bg-slate-200">Tailwind CSS</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+    <div style={{ width: "100vw", height: "100vh", position: "relative" }}>
+      <div style={{ position: "absolute", top: 12, left: 12, zIndex: 10, background: "#fff", padding: 8, borderRadius: 6 }}>
+        <label>
+          Zoom:&nbsp;
+          <select value={zoom} onChange={(e) => setZoom(Number(e.target.value))}>
+            {[10, 11, 12, 13].map((z) => <option key={z} value={z}>{z}</option>)}
+          </select>
+        </label>
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
+      
+      {/* <Canvas
+        camera={{ position: [0, 2_500, 4_500], fov: 45, near: 10, far: 60_000 }}
+        onCreated={({ scene }) => {
+          scene.background = new THREE.Color(SKY_COLOR);
+          // scene.fog = new THREE.Fog(SKY_COLOR, FOG_NEAR, FOG_FAR);
         }}
       >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+        <ambientLight intensity={0.65} />
+        <directionalLight position={[8_000, 15_000, 8_000]} intensity={1.15} />
+        <TerrainScene zoom={zoom} />
+        <OrbitControls
+          target={[44_000, 800, -35_000]}   // Imphal city, world coords
+          maxPolarAngle={Math.PI / 2.15}   // don't let camera go below horizon
+          minDistance={200}
+          maxDistance={55_000}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      </Canvas> */}
+      <Canvas
+        camera={{ position: [0, 15_000, 1], fov: 45, near: 10, far: 120_000 }}
+        onCreated={({ scene }) => {
+          scene.background = new THREE.Color(SKY_COLOR);
+          scene.fog = new THREE.Fog(SKY_COLOR, FOG_NEAR, FOG_FAR);
+        }}
+      >
+        <ambientLight intensity={0.9} />
+        <directionalLight position={[5_000, 20_000, 5_000]} intensity={1.1} />
+        <TerrainScene zoom={zoom} />
+        <OrbitControls
+          target={[0, 800, 0]}
+          // allow straight-down view — remove maxPolarAngle temporarily
+          minDistance={100}
+          maxDistance={30_000}
+        />
+      </Canvas>
+    </div>
   );
 }
 
 export default App;
-
 
 
 ================================================
@@ -397,9 +425,9 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
+  // <React.StrictMode>
     <App />
-  </React.StrictMode>,
+  // </React.StrictMode>,
 );
 
 
@@ -409,6 +437,474 @@ FILE: src/vite-env.d.ts
 ================================================
 /// <reference types="vite/client" />
 
+
+
+================================================
+FILE: src/components/Terrain.tsx
+================================================
+// src/components/Terrain.tsx
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import * as THREE from "three";
+import { decodeQuantizedMesh, type DecodedMesh } from "../lib/quantizedMesh";
+
+interface Props {
+  zoom: number;
+  x: number;
+  y: number;
+}
+
+export function Terrain({ zoom, x, y }: Props) {
+  const [mesh, setMesh] = useState<DecodedMesh | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        // Rust returns Vec<u8> which lands in JS as number[] or Uint8Array.
+        const bytes = await invoke<number[]>("get_terrain_tile", { zoom, x, y });
+        const buf = new Uint8Array(bytes).buffer;
+        const decoded = decodeQuantizedMesh(buf);
+        if (!cancelled) setMesh(decoded);
+        console.log(`Tile ${zoom}/${x}/${y}:`, decoded);
+      } catch (e) {
+        if (!cancelled) setError(String(e));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [zoom, x, y]);
+
+  if (error) return <mesh><boxGeometry /><meshBasicMaterial color="red" /></mesh>;
+  if (!mesh) return null;
+
+  return (
+    <mesh>
+      <bufferGeometry
+        onUpdate={(g) => {
+          g.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
+          g.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+          g.computeVertexNormals();
+          g.computeBoundingSphere();
+        }}
+      />
+      <meshStandardMaterial color="#8B7355" flatShading side={THREE.DoubleSide} />
+    </mesh>
+  );
+}
+
+
+================================================
+FILE: src/components/TerrainScene.tsx
+================================================
+// src/components/TerrainScene.tsx
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useThree } from "@react-three/fiber";
+import { invoke } from "@tauri-apps/api/core";
+import { TerrainTile } from "./TerrainTile";
+import { tileWorldBounds } from "../lib/tileMath";
+
+interface TileCoord { z: number; x: number; y: number; }
+
+const CULL_RADIUS_M = 80_000;       // was 20_000 — covers the full 1° DEM
+const MOVE_THRESHOLD_M = 2_000;     // was 1_000
+const POLL_INTERVAL_MS = 300;
+
+export function TerrainScene({ zoom }: { zoom: number }) {
+  const [all, setAll] = useState<TileCoord[]>([]);
+  const [cameraXZ, setCameraXZ] = useState<[number, number]>([0, 0]);
+  const { camera } = useThree();
+  const last = useRef<[number, number]>([Infinity, Infinity]);
+
+  // Load tile index once
+  useEffect(() => {
+    invoke<TileCoord[]>("list_tiles")
+      .then((tiles) => {
+        console.log(`Loaded ${tiles.length} tile coords`);
+        setAll(tiles);
+      })
+      .catch((e) => console.error("list_tiles failed:", e));
+  }, []);
+
+  // Poll camera position; only trigger re-cull when it moves enough
+  useEffect(() => {
+    const id = setInterval(() => {
+      const { x, z } = camera.position;
+      const [lx, lz] = last.current;
+      if (Math.hypot(x - lx, z - lz) > MOVE_THRESHOLD_M) {
+        last.current = [x, z];
+        setCameraXZ([x, z]);
+      }
+    }, POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [camera]);
+
+  // Filter to visible tiles
+  const visible = useMemo(() => {
+    const [cx, cz] = cameraXZ;
+    const r2 = CULL_RADIUS_M * CULL_RADIUS_M;
+    return all.filter((t) => {
+      if (t.z !== zoom) return false;
+      const w = tileWorldBounds(t.z, t.x, t.y);
+      const dx = w.centerX - cx;
+      const dz = w.centerZ - cz;
+      const halfDiag = Math.hypot(w.sizeX, w.sizeZ) * 0.5;
+      const edge = Math.max(0, Math.hypot(dx, dz) - halfDiag);
+      return edge * edge <= r2;
+    });
+  }, [all, zoom, cameraXZ]);
+
+  useEffect(() => {
+  console.log(`[cull] zoom ${zoom}: ${visible.length} tiles visible`);
+}, [visible.length, zoom]);
+
+  return (
+    <group>
+      {visible.map((t) => (
+        <TerrainTile key={`${t.z}/${t.x}/${t.y}`} z={t.z} x={t.x} y={t.y} />
+      ))}
+    </group>
+  );
+}
+
+
+================================================
+FILE: src/components/TerrainTile.tsx
+================================================
+// src/components/TerrainTile.tsx
+import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import * as THREE from "three";
+import { tileWorldBounds } from "../lib/tileMath";
+import { addSkirts } from "../lib/addSkirts";
+
+
+interface Props { z: number; x: number; y: number; }
+
+export function TerrainTile({ z, x, y }: Props) {
+  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
+
+  // Add near the top of the file:
+  const TILE_OVERLAP = 0.02; // 1% extra, i.e. ~25 m at zoom 12
+
+  useEffect(() => {
+    let alive = true;
+    invoke<ArrayBuffer>("get_terrain_tile_mesh", { zoom: z, x, y })
+      .then((buf) => {
+        if (!alive) return;
+        const view = new DataView(buf);
+        const vcount = view.getUint32(0, true);
+        const icount = view.getUint32(4, true);
+
+        if (vcount < 3 || icount < 3) {
+          // Empty or degenerate tile — nothing to render
+          return;
+        }
+
+        const rawPos = new Float32Array(buf, 8, vcount * 3);
+        const rawIdx = new Uint32Array(buf, 8 + vcount * 12, icount);
+        
+        // Skirt depth: 150 m is plenty — bigger than any plausible crack,
+        // small enough not to poke through neighbouring valleys.
+        // const { positions, indices } = addSkirts(rawPos.slice(), rawIdx.slice(), 150);
+        const { positions, indices } = addSkirts(rawPos.slice(), rawIdx.slice(), 500);
+        
+        // DataView slices reference the same buffer; safe as long as we don't
+        // mutate the original. Copy to own the memory:
+        
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        g.setIndex(new THREE.BufferAttribute(indices, 1));
+        g.computeVertexNormals();
+        g.computeBoundingSphere();
+        setGeometry(g);
+
+      })
+      .catch((e) => console.warn(`tile ${z}/${x}/${y} failed:`, e));
+    return () => { alive = false; };
+  }, [z, x, y]);
+
+  useEffect(() => () => { geometry?.dispose(); }, [geometry]);
+
+  const world = useMemo(() => tileWorldBounds(z, x, y), [z, x, y]);
+
+  if (!geometry) return null;
+
+  return (
+    // Then in the return:
+    <mesh
+      geometry={geometry}
+      position={[world.centerX, 0, world.centerZ]}
+      scale={[
+        (world.sizeX / 2) * (1 + TILE_OVERLAP),
+        1,
+        (world.sizeZ / 2) * (1 + TILE_OVERLAP),
+      ]}
+    >
+      <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />
+    </mesh>
+  );
+}
+
+
+================================================
+FILE: src/lib/addSkirts.ts
+================================================
+// src/lib/addSkirts.ts
+export interface SkirtedGeometry {
+  positions: Float32Array;
+  indices: Uint32Array;
+}
+
+export function addSkirts(
+  positions: Float32Array,
+  indices: Uint32Array,
+  skirtDepth: number,
+): SkirtedGeometry {
+  const vertCount = positions.length / 3;
+
+  // Find actual mesh extents
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  for (let i = 0; i < vertCount; i++) {
+    const x = positions[i * 3];
+    const z = positions[i * 3 + 2];
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  }
+
+  const spanX = Math.max(maxX - minX, 1e-6);
+  const spanZ = Math.max(maxZ - minZ, 1e-6);
+  const epsX = spanX * 0.01;  // 1% tolerance
+  const epsZ = spanZ * 0.01;
+
+  const sides: { N: number[]; S: number[]; E: number[]; W: number[] } =
+    { N: [], S: [], E: [], W: [] };
+
+  for (let i = 0; i < vertCount; i++) {
+    const x = positions[i * 3];
+    const z = positions[i * 3 + 2];
+    if (Math.abs(x - minX) < epsX) sides.W.push(i);
+    if (Math.abs(x - maxX) < epsX) sides.E.push(i);
+    if (Math.abs(z - minZ) < epsZ) sides.N.push(i);
+    if (Math.abs(z - maxZ) < epsZ) sides.S.push(i);
+  }
+
+  const extraPos: number[] = [];
+  const extraIdx: number[] = [];
+
+  const buildSkirt = (verts: number[], sortAxis: 0 | 2) => {
+    if (verts.length < 2) return;
+    verts.sort((a, b) => positions[a * 3 + sortAxis] - positions[b * 3 + sortAxis]);
+    const base = vertCount + extraPos.length / 3;
+    for (const i of verts) {
+      extraPos.push(positions[i * 3], positions[i * 3 + 1] - skirtDepth, positions[i * 3 + 2]);
+    }
+    for (let i = 0; i < verts.length - 1; i++) {
+      const a = verts[i], b = verts[i + 1];
+      const c = base + i, d = base + i + 1;
+      extraIdx.push(a, c, b);
+      extraIdx.push(b, c, d);
+    }
+  };
+
+  buildSkirt(sides.N, 0);
+  buildSkirt(sides.S, 0);
+  buildSkirt(sides.E, 2);
+  buildSkirt(sides.W, 2);
+
+  const outPos = new Float32Array(positions.length + extraPos.length);
+  outPos.set(positions);
+  outPos.set(extraPos, positions.length);
+
+  const outIdx = new Uint32Array(indices.length + extraIdx.length);
+  outIdx.set(indices);
+  outIdx.set(extraIdx, indices.length);
+
+  return { positions: outPos, indices: outIdx };
+}
+
+
+================================================
+FILE: src/lib/quantizedMesh.ts
+================================================
+// src/lib/quantizedMesh.ts
+// Minimal decoder for Cesium quantized-mesh-1.0.
+// Returns positions (Float32Array, xyz) and indices (Uint32Array).
+
+export interface DecodedMesh {
+  positions: Float32Array; // xyz interleaved, centered at (0,0,0)
+  indices: Uint32Array;
+  minHeight: number;
+  maxHeight: number;
+  center: [number, number, number];
+}
+
+const MAGIC = "quantized-mesh-1.0";
+
+function readMagic(view: DataView): string {
+  let s = "";
+  for (let i = 0; i < 24; i++) {
+    const c = view.getUint8(i);
+    if (c === 0) break;
+    s += String.fromCharCode(c);
+  }
+  return s;
+}
+
+const zigZag = (v: number) => (v >> 1) ^ (-(v & 1));
+
+export function decodeQuantizedMesh(buffer: ArrayBufferLike): DecodedMesh {
+  const view = new DataView(buffer);
+  const magic = readMagic(view);
+  if (magic !== MAGIC) throw new Error(`Bad magic: "${magic}"`);
+
+  let offset = 24;
+  const version = view.getUint32(offset, true); offset += 4;
+  if (version !== 1) throw new Error(`Unsupported version ${version}`);
+
+  const vertexCount = view.getUint32(offset, true); offset += 4;
+  const triangleCount = view.getUint32(offset, true); offset += 4;
+
+  // Header (unchanged from spec):
+  const centerX = view.getFloat64(offset, true); offset += 8;
+  const centerY = view.getFloat64(offset, true); offset += 8;
+  const centerZ = view.getFloat64(offset, true); offset += 8;
+  const minHeight = view.getFloat32(offset, true); offset += 4;
+  const maxHeight = view.getFloat32(offset, true); offset += 4;
+
+  // Skip bounding sphere (center[3] + radius) = 32 bytes
+  offset += 32;
+  // Skip horizon occlusion point (3 doubles) = 24 bytes
+  offset += 24;
+
+  // ----- Vertex data -----
+  // u, v, height arrays — each u16, delta + zigzag encoded
+  const u = new Uint16Array(buffer, offset, vertexCount);
+  offset += vertexCount * 2;
+  const v = new Uint16Array(buffer, offset, vertexCount);
+  offset += vertexCount * 2;
+  const h = new Uint16Array(buffer, offset, vertexCount);
+  offset += vertexCount * 2;
+
+  const uu = new Uint16Array(vertexCount);
+  const vv = new Uint16Array(vertexCount);
+  const hh = new Uint16Array(vertexCount);
+
+  let uSum = 0, vSum = 0, hSum = 0;
+  for (let i = 0; i < vertexCount; i++) {
+    uSum += zigZag(u[i]); uu[i] = uSum & 0xffff;
+    vSum += zigZag(v[i]); vv[i] = vSum & 0xffff;
+    hSum += zigZag(h[i]); hh[i] = hSum & 0xffff;
+  }
+
+  // ----- Index data -----
+  // High-water-mark decode. uint16 if vertexCount < 65536, else uint32.
+  const use32 = vertexCount > 65536;
+  const rawIndexCount = triangleCount * 3;
+  let rawIndices: Uint16Array | Uint32Array;
+
+  if (use32) {
+    // Align to 4 bytes
+    if (offset % 4 !== 0) offset += 4 - (offset % 4);
+    rawIndices = new Uint32Array(buffer, offset, rawIndexCount);
+    offset += rawIndexCount * 4;
+  } else {
+    rawIndices = new Uint16Array(buffer, offset, rawIndexCount);
+    offset += rawIndexCount * 2;
+  }
+
+  const indices = new Uint32Array(rawIndexCount);
+  let highest = 0;
+  for (let i = 0; i < rawIndexCount; i++) {
+    const code = rawIndices[i];
+    indices[i] = highest - code;
+    if (code === 0) highest++;
+  }
+
+  // ----- Build positions -----
+  // Quantized u,v map [0,65535] -> [0,1] across the tile.
+  // Heights map [0,32767] -> [minHeight, maxHeight].
+  // We normalize to a [-1,1] x [-1,1] x [h0,h1] box for simplicity.
+  const positions = new Float32Array(vertexCount * 3);
+  const heightRange = maxHeight - minHeight;
+  for (let i = 0; i < vertexCount; i++) {
+    const x = (uu[i] / 65535) * 2 - 1;
+    const y = (vv[i] / 65535) * 2 - 1;
+    const z = minHeight + (hh[i] / 32767) * heightRange;
+    positions[i * 3 + 0] = x;
+    positions[i * 3 + 1] = z; // scale down meters for scene
+    positions[i * 3 + 2] = y;
+  }
+
+  return {
+    positions,
+    indices,
+    minHeight,
+    maxHeight,
+    center: [centerX, centerY, centerZ],
+  };
+}
+
+
+================================================
+FILE: src/lib/tileMath.ts
+================================================
+// src/lib/tileMath.ts
+// Local ENU (East-North-Up) frame centered on the valley.
+// Three.js convention: X = east, Y = up (elevation), Z = -north (so camera looking -Z faces north).
+
+export const VALLEY_CENTER_LON = 93.5;   // was 94.0
+export const VALLEY_CENTER_LAT = 24.5;   // was 25.0
+
+const METERS_PER_DEG_LAT = 110_540;
+export function metersPerDegLon(latDeg: number): number {
+  return 111_320 * Math.cos((latDeg * Math.PI) / 180);
+}
+
+export interface LonLatBounds { west: number; south: number; east: number; north: number; }
+
+/**
+ * Cesium geodetic TMS (GeographicTilingScheme):
+ *   level 0 = 2 tiles in X (180° lon each) × 1 tile in Y (180° lat each)
+ *   level z = 2^(z+1) tiles in X, 2^z tiles in Y
+ *   → lonSpan = latSpan = 180 / 2^z
+ */
+export function tileBounds(z: number, x: number, y: number): LonLatBounds {
+  const lonSpan = 180 / 2 ** z;
+  const latSpan = 180 / 2 ** z;
+  const west = -180 + x * lonSpan;
+  const south = -90 + y * latSpan;
+  return { west, south, east: west + lonSpan, north: south + latSpan };
+}
+
+export interface WorldBounds {
+  west: number; east: number;
+  north: number; south: number;
+  centerX: number; centerZ: number;
+  sizeX: number; sizeZ: number;
+}
+
+/** Convert a TMS tile to world-space AABB in meters. */
+export function tileWorldBounds(z: number, x: number, y: number): WorldBounds {
+  const b = tileBounds(z, x, y);
+  const mLon = metersPerDegLon((b.north + b.south) / 2);
+
+  const west  = (b.west  - VALLEY_CENTER_LON) * mLon;
+  const east  = (b.east  - VALLEY_CENTER_LON) * mLon;
+  // Y-up, right-handed: north is -Z
+  const north = -(b.north - VALLEY_CENTER_LAT) * METERS_PER_DEG_LAT;
+  const south = -(b.south - VALLEY_CENTER_LAT) * METERS_PER_DEG_LAT;
+
+  return {
+    west, east, north, south,
+    centerX: (west + east) / 2,
+    centerZ: (north + south) / 2,
+    sizeX: east - west,
+    sizeZ: south - north, // positive
+  };
+}
 
 
 ================================================
@@ -447,7 +943,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-quantized-mesh = "0.3"
+flate2 = "1"
+quantized-mesh = "0.3.0"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -526,26 +1023,10 @@ FILE: src-tauri/icons/icon.icns
 
 
 ================================================
-FILE: src-tauri/resources/terrain/srtm_tiles/tileset.json
-================================================
-{
-    "tilejson": "2.1.0",
-    "format": "quantized-mesh-1.0",
-    "scheme": "tms",
-    "tiles": ["{z}/{x}/{y}.terrain"],
-    "minLevel": 10,
-    "maxLevel": 13,
-    "bounds": [93, 24, 95, 26],
-    "center": [94, 25, 0],
-    "description": "Imphal Valley Terrain - SRTM 1 Arc-Second (Geodetic TMS)",
-    "attribution": "SRTM 1 Arc-Second Global DEM - USGS EarthExplorer"
-}
-
-
-================================================
 FILE: src-tauri/src/lib.rs
 ================================================
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod terrain;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -555,7 +1036,13 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            terrain::get_terrain_tile,
+            terrain::get_terrain_tile_mesh,
+            terrain::get_tileset,
+            terrain::list_tiles
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -577,41 +1064,235 @@ fn main() {
 ================================================
 FILE: src-tauri/src/terrain.rs
 ================================================
+use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
-use tauri::Manager;
+use tauri::ipc::Response;
+use tauri::{AppHandle, Manager};
 
-// Command to read a terrain tile and return it as a byte vector
+/// Tileset metadata structure, mirrors resources/terrain/srtm_tiles/tileset.json
+#[derive(Serialize)]
+pub struct TilesetMeta {
+    pub min_level: u8,
+    pub max_level: u8,
+    pub bounds: [f64; 4],
+}
+
 #[tauri::command]
-async fn get_terrain_tile(
-    app_handle: tauri::AppHandle,
+pub async fn get_terrain_tile(
+    app: AppHandle,
     zoom: u8,
     x: u32,
     y: u32,
-) -> Result<Vec<u8>, String> {
-    // Construct the path to the bundled tile
-    // This assumes your tiles are in "assets/terrain/{z}/{x}/{y}.terrain"
-    let resource_path = app_handle
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
+) -> Result<Response, String> {
+    let path = tile_path(&app, zoom, x, y)?;
+    let raw = fs::read(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
 
-    let tile_path: PathBuf = resource_path
-        .join("assets")
-        .join("terrain")
-        .join(zoom.to_string())
-        .join(x.to_string())
-        .join(format!("{}.terrain", y));
+    // Trace bytes we're about to send
+    println!(
+        "[terrain] {}/{}/{}: on-disk {} bytes, first={:02x} {:02x}",
+        zoom,
+        x,
+        y,
+        raw.len(),
+        raw[0],
+        raw[1]
+    );
 
-    // Read the file
-    fs::read(&tile_path).map_err(|e| format!("Failed to read tile at {:?}: {}", tile_path, e))
+    // Gzip magic: 1F 8B
+    let bytes = if raw.len() >= 2 && raw[0] == 0x1F && raw[1] == 0x8B {
+        use std::io::Read;
+        let mut gz = flate2::read::GzDecoder::new(&raw[..]);
+        let mut out = Vec::new();
+        gz.read_to_end(&mut out)
+            .map_err(|e| format!("gunzip {:?}: {}", path, e))?;
+        println!("[terrain]   → decompressed to {} bytes", out.len());
+        out
+    } else {
+        raw
+    };
+
+    // First 16 bytes of what we're sending (should start with "quantized")
+    let head: Vec<String> = bytes
+        .iter()
+        .take(16)
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    println!("[terrain]   → sending head=[{}]", head.join(" "));
+
+    Ok(Response::new(bytes))
 }
 
-fn main() {
-    tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![get_terrain_tile])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+/// Convenience: return tileset metadata so the frontend knows what to load.
+#[tauri::command]
+pub async fn get_tileset(app: AppHandle) -> Result<TilesetMeta, String> {
+    let path = resource_root(&app)?.join("tileset.json");
+    let raw = fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse tileset: {}", e))?;
+
+    Ok(TilesetMeta {
+        min_level: json["minLevel"].as_u64().unwrap_or(10) as u8,
+        max_level: json["maxLevel"].as_u64().unwrap_or(13) as u8,
+        bounds: [
+            json["bounds"][0].as_f64().unwrap_or(0.0),
+            json["bounds"][1].as_f64().unwrap_or(0.0),
+            json["bounds"][2].as_f64().unwrap_or(0.0),
+            json["bounds"][3].as_f64().unwrap_or(0.0),
+        ],
+    })
+}
+
+// ---------- helpers ----------
+
+/// Resolves to <resource_dir>/resources/terrain/srtm_tiles
+fn resource_root(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir: {}", e))?;
+    Ok(dir.join("resources").join("terrain").join("srtm_tiles"))
+}
+
+fn tile_path(app: &AppHandle, zoom: u8, x: u32, y: u32) -> Result<PathBuf, String> {
+    Ok(resource_root(app)?
+        .join(zoom.to_string())
+        .join(x.to_string())
+        .join(format!("{}.terrain", y)))
+}
+
+#[derive(Serialize)]
+pub struct TileCoord {
+    pub z: u8,
+    pub x: u32,
+    pub y: u32,
+}
+
+/// Walk resources/terrain/srtm_tiles/{z}/{x}/{y}.terrain and return coords.
+#[tauri::command]
+pub async fn list_tiles(app: AppHandle) -> Result<Vec<TileCoord>, String> {
+    let root = resource_root(&app)?;
+    let mut out = Vec::new();
+    walk_z(&root, &mut out).map_err(|e| format!("walk {:?}: {}", root, e))?;
+    Ok(out)
+}
+
+fn walk_z(dir: &std::path::Path, out: &mut Vec<TileCoord>) -> std::io::Result<()> {
+    for z_entry in fs::read_dir(dir)? {
+        let z_entry = z_entry?;
+        if !z_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let z: u8 = match z_entry.file_name().to_string_lossy().parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for x_entry in fs::read_dir(z_entry.path())? {
+            let x_entry = x_entry?;
+            if !x_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let x: u32 = match x_entry.file_name().to_string_lossy().parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for y_entry in fs::read_dir(x_entry.path())? {
+                let y_entry = y_entry?;
+                let name = y_entry.file_name();
+                let name = name.to_string_lossy();
+                let stem = match name.strip_suffix(".terrain") {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let y: u32 = match stem.parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                out.push(TileCoord { z, x, y });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Decode a terrain tile in Rust and return a compact binary blob:
+///   [vertexCount: u32 LE][indexCount: u32 LE]
+///   [positions: f32 × 3 × vertexCount]  (x, y, z)
+///   [indices:   u32 × indexCount]
+///
+/// Heights are kept as absolute metres. X/Y are quantized u/v mapped to [0,1].
+#[tauri::command]
+pub async fn get_terrain_tile_mesh(
+    app: AppHandle,
+    zoom: u8,
+    x: u32,
+    y: u32,
+) -> Result<Response, String> {
+    // ---- read + gunzip ----
+    let path = tile_path(&app, zoom, x, y)?;
+    let raw = fs::read(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+    let bytes = if raw.len() >= 2 && raw[0] == 0x1F && raw[1] == 0x8B {
+        use std::io::Read;
+        let mut gz = flate2::read::GzDecoder::new(&raw[..]);
+        let mut out = Vec::new();
+        gz.read_to_end(&mut out)
+            .map_err(|e| format!("gunzip: {}", e))?;
+        out
+    } else {
+        raw
+    };
+
+    // ---- decode using quantized-mesh's own decoder ----
+    let mesh = quantized_mesh::DecodedMesh::decode(&bytes)
+        .map_err(|e| format!("decode tile {}/{}/{}: {}", zoom, x, y, e))?;
+
+    // let vcount = mesh.vertices.u.len();
+    // let icount = mesh.indices.len();
+    let vcount = mesh.vertices.u.len();
+    let icount = mesh.indices.len();
+
+    // Emit-only-empty-diagnostic for tiles with < 3 vertices
+    if vcount < 3 {
+        println!(
+            "[terrain-empty] {}/{}/{}: verts={}, idx={} — skipping",
+            zoom, x, y, vcount, icount
+        );
+        // Return a minimal "empty" payload: counts = 0, no data
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        return Ok(Response::new(out));
+    }
+
+    // Also log a one-time summary line per tile
+    println!(
+        "[terrain] {}/{}/{}: verts={}, idx={}, min={:.1}, max={:.1}",
+        zoom, x, y, vcount, icount, mesh.header.min_height, mesh.header.max_height
+    );
+
+    let min_h = mesh.header.min_height as f64;
+    let max_h = mesh.header.max_height as f64;
+    let span = (max_h - min_h).max(1e-6);
+
+    let mut out: Vec<u8> = Vec::with_capacity(8 + vcount * 12 + icount * 4);
+    out.extend_from_slice(&(vcount as u32).to_le_bytes());
+    out.extend_from_slice(&(icount as u32).to_le_bytes());
+
+    for i in 0..vcount {
+        // u,v in [0, 32767] → [-1, 1] scene units
+        let u = (mesh.vertices.u[i] as f32 / 32767.0) * 2.0 - 1.0;
+        let v = (mesh.vertices.v[i] as f32 / 32767.0) * 2.0 - 1.0;
+        // height in metres (absolute)
+        let h = min_h as f32 + (mesh.vertices.height[i] as f32 / 32767.0) * span as f32;
+        out.extend_from_slice(&u.to_le_bytes());
+        out.extend_from_slice(&h.to_le_bytes()); // Y = elevation
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for idx in &mesh.indices {
+        out.extend_from_slice(&idx.to_le_bytes());
+    }
+
+    Ok(Response::new(out))
 }
 
 

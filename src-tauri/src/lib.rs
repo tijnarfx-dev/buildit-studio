@@ -11,10 +11,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             greet,
-            terrain::get_terrain_tile,
-            terrain::get_terrain_tile_mesh,
-            terrain::get_tileset,
-            terrain::list_tiles
+            terrain::load_dem_mesh,
+            // terrain::get_terrain_tile,
+            // terrain::get_terrain_tile_mesh,
+            // terrain::get_tileset,
+            // terrain::list_tiles
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
