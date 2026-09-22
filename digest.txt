@@ -349,65 +349,50 @@ button {
 ================================================
 FILE: src/App.tsx
 ================================================
-// src/App.tsx
-import * as THREE from "three";
 import { useState } from "react";
 import { Canvas } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
-import { TerrainScene } from "./components/TerrainScene";
+import { Terrain } from "./components/Terrain";
+import * as THREE from "three";
 import "./App.css";
 
+const SKY_COLOR = "#b8d4e8";
 
 function App() {
-  const [zoom, setZoom] = useState(11);
-
-  const SKY_COLOR = "#b8d4e8";       // pale blue
-  const FOG_NEAR = 15_000;            // start fading at 8 km
-  const FOG_FAR = 60_000;            // fully fogged at 20 km (= cull radius)
+  const [stride, setStride] = useState(8);   // start conservative
 
   return (
     <div style={{ width: "100vw", height: "100vh", position: "relative" }}>
-      <div style={{ position: "absolute", top: 12, left: 12, zIndex: 10, background: "#fff", padding: 8, borderRadius: 6 }}>
-        <label>
-          Zoom:&nbsp;
-          <select value={zoom} onChange={(e) => setZoom(Number(e.target.value))}>
-            {[10, 11, 12, 13].map((z) => <option key={z} value={z}>{z}</option>)}
-          </select>
-        </label>
+      <div style={{
+        position: "absolute", top: 12, left: 12, zIndex: 10,
+        background: "#fff", padding: 8, borderRadius: 6,
+        fontFamily: "monospace", fontSize: 13,
+      }}>
+        Stride:&nbsp;
+        <select value={stride} onChange={(e) => setStride(Number(e.target.value))}>
+          <option value={16}>16 (fastest, coarse)</option>
+          <option value={8}>8  (fast)</option>
+          <option value={4}>4  (balanced)</option>
+          <option value={2}>2  (detailed, may lag)</option>
+          <option value={1}>1  (full 30 m — heavy)</option>
+        </select>
       </div>
-      
-      {/* <Canvas
-        camera={{ position: [0, 2_500, 4_500], fov: 45, near: 10, far: 60_000 }}
-        onCreated={({ scene }) => {
-          scene.background = new THREE.Color(SKY_COLOR);
-          // scene.fog = new THREE.Fog(SKY_COLOR, FOG_NEAR, FOG_FAR);
-        }}
-      >
-        <ambientLight intensity={0.65} />
-        <directionalLight position={[8_000, 15_000, 8_000]} intensity={1.15} />
-        <TerrainScene zoom={zoom} />
-        <OrbitControls
-          target={[44_000, 800, -35_000]}   // Imphal city, world coords
-          maxPolarAngle={Math.PI / 2.15}   // don't let camera go below horizon
-          minDistance={200}
-          maxDistance={55_000}
-        />
-      </Canvas> */}
+
       <Canvas
-        camera={{ position: [0, 15_000, 1], fov: 45, near: 10, far: 120_000 }}
+        camera={{ position: [0, 20_000, 25_000], fov: 45, near: 10, far: 120_000 }}
         onCreated={({ scene }) => {
           scene.background = new THREE.Color(SKY_COLOR);
-          scene.fog = new THREE.Fog(SKY_COLOR, FOG_NEAR, FOG_FAR);
+          scene.fog = new THREE.Fog(SKY_COLOR, 30_000, 90_000);
         }}
       >
-        <ambientLight intensity={0.9} />
-        <directionalLight position={[5_000, 20_000, 5_000]} intensity={1.1} />
-        <TerrainScene zoom={zoom} />
+        <ambientLight intensity={0.7} />
+        <directionalLight position={[20_000, 30_000, 20_000]} intensity={1.2} />
+        <Terrain stride={stride} />
         <OrbitControls
           target={[0, 800, 0]}
-          // allow straight-down view — remove maxPolarAngle temporarily
-          minDistance={100}
-          maxDistance={30_000}
+          maxPolarAngle={Math.PI / 2.15}
+          minDistance={500}
+          maxDistance={80_000}
         />
       </Canvas>
     </div>
@@ -442,54 +427,91 @@ FILE: src/vite-env.d.ts
 ================================================
 FILE: src/components/Terrain.tsx
 ================================================
-// src/components/Terrain.tsx
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
-import { decodeQuantizedMesh, type DecodedMesh } from "../lib/quantizedMesh";
 
-interface Props {
-  zoom: number;
-  x: number;
-  y: number;
-}
+const METERS_PER_DEG_LAT = 110_540;
+const metersPerDegLon = (lat: number) => 111_320 * Math.cos((lat * Math.PI) / 180);
 
-export function Terrain({ zoom, x, y }: Props) {
-  const [mesh, setMesh] = useState<DecodedMesh | null>(null);
-  const [error, setError] = useState<string | null>(null);
+export function Terrain({ stride }: { stride: number }) {
+  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
+  const [stats, setStats] = useState<string>("");
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        // Rust returns Vec<u8> which lands in JS as number[] or Uint8Array.
-        const bytes = await invoke<number[]>("get_terrain_tile", { zoom, x, y });
-        const buf = new Uint8Array(bytes).buffer;
-        const decoded = decodeQuantizedMesh(buf);
-        if (!cancelled) setMesh(decoded);
-        console.log(`Tile ${zoom}/${x}/${y}:`, decoded);
-      } catch (e) {
-        if (!cancelled) setError(String(e));
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [zoom, x, y]);
+    let alive = true;
+    const t0 = performance.now();
+    console.log(`[dem] loading stride=${stride}`);
+    invoke<ArrayBuffer>("load_dem_mesh", { stride })
+      .then((buf) => {
+        if (!alive) return;
+        const view = new DataView(buf);
+        const width  = view.getUint32(0, true);    // bytes 0-3
+        const height = view.getUint32(4, true);    // bytes 4-7
+        const west   = view.getFloat64(8, true);   // bytes 8-15
+        const south  = view.getFloat64(16, true);  // bytes 16-23
+        const east   = view.getFloat64(24, true);  // bytes 24-31
+        const north  = view.getFloat64(32, true);  // bytes 32-39
+        const heights = new Float32Array(buf, 40, width * height);  // ← 40, not 32
 
-  if (error) return <mesh><boxGeometry /><meshBasicMaterial color="red" /></mesh>;
-  if (!mesh) return null;
+        const midLat = (south + north) / 2;
+        const widthM = (east - west) * metersPerDegLon(midLat);
+        const depthM = (north - south) * METERS_PER_DEG_LAT;
+
+        const positions = new Float32Array(width * height * 3);
+        let minH = Infinity, maxH = -Infinity;
+        for (let j = 0; j < height; j++) {
+          for (let i = 0; i < width; i++) {
+            const idx = (j * width + i) * 3;
+            positions[idx]     = (i / (width - 1) - 0.5) * widthM;
+            positions[idx + 1] = heights[j * width + i];
+            positions[idx + 2] = (0.5 - j / (height - 1)) * depthM;
+            if (positions[idx + 1] < minH) minH = positions[idx + 1];
+            if (positions[idx + 1] > maxH) maxH = positions[idx + 1];
+          }
+        }
+
+        const indices = new Uint32Array((width - 1) * (height - 1) * 6);
+        let k = 0;
+        for (let j = 0; j < height - 1; j++) {
+          for (let i = 0; i < width - 1; i++) {
+            const a = j * width + i;
+            const b = a + 1;
+            const c = a + width;
+            const d = c + 1;
+            indices[k++] = a; indices[k++] = c; indices[k++] = b;
+            indices[k++] = b; indices[k++] = c; indices[k++] = d;
+          }
+        }
+
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        g.setIndex(new THREE.BufferAttribute(indices, 1));
+        g.computeVertexNormals();
+        g.computeBoundingSphere();
+        setGeometry(g);
+
+        const ms = (performance.now() - t0).toFixed(0);
+        const info = `${width}×${height} = ${(width * height / 1e6).toFixed(2)}M verts, ` +
+                     `elev ${minH.toFixed(0)}–${maxH.toFixed(0)} m, ${ms} ms`;
+        console.log(`[dem] ${info}`);
+        setStats(info);
+      })
+      .catch((e) => console.error("[dem] failed:", e));
+    return () => { alive = false; };
+  }, [stride]);
+
+  useEffect(() => () => { geometry?.dispose(); }, [geometry]);
+
+  if (!geometry) return null;
 
   return (
-    <mesh>
-      <bufferGeometry
-        onUpdate={(g) => {
-          g.setAttribute("position", new THREE.BufferAttribute(mesh.positions, 3));
-          g.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
-          g.computeVertexNormals();
-          g.computeBoundingSphere();
-        }}
-      />
-      <meshStandardMaterial color="#8B7355" flatShading side={THREE.DoubleSide} />
-    </mesh>
+    <>
+      <mesh geometry={geometry}>
+        <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />
+      </mesh>
+      {/* Debug text via DOM — handled in App, this is just for context */}
+    </>
   );
 }
 
@@ -945,6 +967,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = "1"
 quantized-mesh = "0.3.0"
+georaster = "0.2.0"
+tiff = "0.9"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
@@ -985,7 +1009,7 @@ FILE: src-tauri/tauri.conf.json
   "bundle": {
     "active": true,
     "resources": [
-        "resources/terrain/srtm_tiles"
+        "resources/dem/imphal_full.tif"
       ],
     "targets": "all",
     "icon": [
@@ -1036,12 +1060,14 @@ fn greet(name: &str) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(terrain::DemCache::new())
         .invoke_handler(tauri::generate_handler![
             greet,
-            terrain::get_terrain_tile,
-            terrain::get_terrain_tile_mesh,
-            terrain::get_tileset,
-            terrain::list_tiles
+            terrain::load_dem_mesh,
+            // terrain::get_terrain_tile,
+            // terrain::get_terrain_tile_mesh,
+            // terrain::get_tileset,
+            // terrain::list_tiles
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1064,233 +1090,141 @@ fn main() {
 ================================================
 FILE: src-tauri/src/terrain.rs
 ================================================
-use serde::Serialize;
-use std::fs;
-use std::path::PathBuf;
+use georaster::geotiff::{GeoTiffReader, RasterValue};
+use std::fs::File;
+use std::io::BufReader;
+use std::sync::Mutex;
 use tauri::ipc::Response;
 use tauri::{AppHandle, Manager};
 
-/// Tileset metadata structure, mirrors resources/terrain/srtm_tiles/tileset.json
-#[derive(Serialize)]
-pub struct TilesetMeta {
-    pub min_level: u8,
-    pub max_level: u8,
-    pub bounds: [f64; 4],
+// ---- Cached full-resolution DEM ----
+pub struct DemData {
+    pub width: u32,
+    pub height: u32,
+    pub west: f64,
+    pub south: f64,
+    pub east: f64,
+    pub north: f64,
+    pub heights: Vec<f32>, // row-major, north → south
 }
 
-#[tauri::command]
-pub async fn get_terrain_tile(
-    app: AppHandle,
-    zoom: u8,
-    x: u32,
-    y: u32,
-) -> Result<Response, String> {
-    let path = tile_path(&app, zoom, x, y)?;
-    let raw = fs::read(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+pub struct DemCache(pub Mutex<Option<DemData>>);
 
-    // Trace bytes we're about to send
-    println!(
-        "[terrain] {}/{}/{}: on-disk {} bytes, first={:02x} {:02x}",
-        zoom,
-        x,
-        y,
-        raw.len(),
-        raw[0],
-        raw[1]
-    );
+impl DemCache {
+    pub fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+}
 
-    // Gzip magic: 1F 8B
-    let bytes = if raw.len() >= 2 && raw[0] == 0x1F && raw[1] == 0x8B {
-        use std::io::Read;
-        let mut gz = flate2::read::GzDecoder::new(&raw[..]);
-        let mut out = Vec::new();
-        gz.read_to_end(&mut out)
-            .map_err(|e| format!("gunzip {:?}: {}", path, e))?;
-        println!("[terrain]   → decompressed to {} bytes", out.len());
-        out
-    } else {
-        raw
+fn read_full_dem(path: &std::path::Path) -> Result<DemData, String> {
+    let file = File::open(path).map_err(|e| format!("open {:?}: {}", path, e))?;
+    let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))
+        .map_err(|e| format!("tiff decoder: {}", e))?;
+
+    let (w, h) = decoder.dimensions().map_err(|e| format!("dims: {}", e))?;
+    let img = decoder
+        .read_image()
+        .map_err(|e| format!("read_image: {}", e))?;
+
+    use tiff::decoder::DecodingResult as DR;
+    let heights: Vec<f32> = match img {
+        DR::F32(v) => v,
+        DR::F64(v) => v.into_iter().map(|x| x as f32).collect(),
+        DR::I16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DR::I32(v) => v.into_iter().map(|x| x as f32).collect(),
+        DR::U8(v) => v.into_iter().map(|x| x as f32).collect(),
+        DR::U16(v) => v.into_iter().map(|x| x as f32).collect(),
+        DR::U32(v) => v.into_iter().map(|x| x as f32).collect(),
+        _ => return Err("unsupported pixel format".to_string()),
     };
 
-    // First 16 bytes of what we're sending (should start with "quantized")
-    let head: Vec<String> = bytes
-        .iter()
-        .take(16)
-        .map(|b| format!("{:02x}", b))
-        .collect();
-    println!("[terrain]   → sending head=[{}]", head.join(" "));
+    // From gdalinfo: Origin=(92.9998611, 25.0001389), PixelSize=0.0002777...
+    let west = 92.9998611_f64;
+    let north = 25.0001389_f64;
+    let px_size = 0.000277777777778_f64;
+    let east = west + w as f64 * px_size;
+    let south = north - h as f64 * px_size;
 
-    Ok(Response::new(bytes))
-}
-
-/// Convenience: return tileset metadata so the frontend knows what to load.
-#[tauri::command]
-pub async fn get_tileset(app: AppHandle) -> Result<TilesetMeta, String> {
-    let path = resource_root(&app)?.join("tileset.json");
-    let raw = fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse tileset: {}", e))?;
-
-    Ok(TilesetMeta {
-        min_level: json["minLevel"].as_u64().unwrap_or(10) as u8,
-        max_level: json["maxLevel"].as_u64().unwrap_or(13) as u8,
-        bounds: [
-            json["bounds"][0].as_f64().unwrap_or(0.0),
-            json["bounds"][1].as_f64().unwrap_or(0.0),
-            json["bounds"][2].as_f64().unwrap_or(0.0),
-            json["bounds"][3].as_f64().unwrap_or(0.0),
-        ],
+    Ok(DemData {
+        width: w,
+        height: h,
+        west,
+        south,
+        east,
+        north,
+        heights,
     })
 }
 
-// ---------- helpers ----------
-
-/// Resolves to <resource_dir>/resources/terrain/srtm_tiles
-fn resource_root(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("resource_dir: {}", e))?;
-    Ok(dir.join("resources").join("terrain").join("srtm_tiles"))
-}
-
-fn tile_path(app: &AppHandle, zoom: u8, x: u32, y: u32) -> Result<PathBuf, String> {
-    Ok(resource_root(app)?
-        .join(zoom.to_string())
-        .join(x.to_string())
-        .join(format!("{}.terrain", y)))
-}
-
-#[derive(Serialize)]
-pub struct TileCoord {
-    pub z: u8,
-    pub x: u32,
-    pub y: u32,
-}
-
-/// Walk resources/terrain/srtm_tiles/{z}/{x}/{y}.terrain and return coords.
 #[tauri::command]
-pub async fn list_tiles(app: AppHandle) -> Result<Vec<TileCoord>, String> {
-    let root = resource_root(&app)?;
-    let mut out = Vec::new();
-    walk_z(&root, &mut out).map_err(|e| format!("walk {:?}: {}", root, e))?;
-    Ok(out)
-}
-
-fn walk_z(dir: &std::path::Path, out: &mut Vec<TileCoord>) -> std::io::Result<()> {
-    for z_entry in fs::read_dir(dir)? {
-        let z_entry = z_entry?;
-        if !z_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let z: u8 = match z_entry.file_name().to_string_lossy().parse() {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        for x_entry in fs::read_dir(z_entry.path())? {
-            let x_entry = x_entry?;
-            if !x_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let x: u32 = match x_entry.file_name().to_string_lossy().parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for y_entry in fs::read_dir(x_entry.path())? {
-                let y_entry = y_entry?;
-                let name = y_entry.file_name();
-                let name = name.to_string_lossy();
-                let stem = match name.strip_suffix(".terrain") {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let y: u32 = match stem.parse() {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                out.push(TileCoord { z, x, y });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Decode a terrain tile in Rust and return a compact binary blob:
-///   [vertexCount: u32 LE][indexCount: u32 LE]
-///   [positions: f32 × 3 × vertexCount]  (x, y, z)
-///   [indices:   u32 × indexCount]
-///
-/// Heights are kept as absolute metres. X/Y are quantized u/v mapped to [0,1].
-#[tauri::command]
-pub async fn get_terrain_tile_mesh(
+pub async fn load_dem_mesh(
     app: AppHandle,
-    zoom: u8,
-    x: u32,
-    y: u32,
+    cache: tauri::State<'_, DemCache>,
+    stride: u32,
 ) -> Result<Response, String> {
-    // ---- read + gunzip ----
-    let path = tile_path(&app, zoom, x, y)?;
-    let raw = fs::read(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
-    let bytes = if raw.len() >= 2 && raw[0] == 0x1F && raw[1] == 0x8B {
-        use std::io::Read;
-        let mut gz = flate2::read::GzDecoder::new(&raw[..]);
-        let mut out = Vec::new();
-        gz.read_to_end(&mut out)
-            .map_err(|e| format!("gunzip: {}", e))?;
-        out
-    } else {
-        raw
-    };
+    // ---- Ensure the full-res DEM is loaded once ----
+    let needs_load = cache.0.lock().unwrap().is_none();
+    if needs_load {
+        let path = app
+            .path()
+            .resource_dir()
+            .map_err(|e| format!("resource_dir: {}", e))?
+            .join("resources")
+            .join("dem")
+            .join("imphal_full.tif");
 
-    // ---- decode using quantized-mesh's own decoder ----
-    let mesh = quantized_mesh::DecodedMesh::decode(&bytes)
-        .map_err(|e| format!("decode tile {}/{}/{}: {}", zoom, x, y, e))?;
+        let t0 = std::time::Instant::now();
+        let dem = tauri::async_runtime::spawn_blocking(move || read_full_dem(&path))
+            .await
+            .map_err(|e| format!("join: {}", e))??;
 
-    // let vcount = mesh.vertices.u.len();
-    // let icount = mesh.indices.len();
-    let vcount = mesh.vertices.u.len();
-    let icount = mesh.indices.len();
-
-    // Emit-only-empty-diagnostic for tiles with < 3 vertices
-    if vcount < 3 {
         println!(
-            "[terrain-empty] {}/{}/{}: verts={}, idx={} — skipping",
-            zoom, x, y, vcount, icount
+            "[dem] full DEM loaded in {} ms: {}×{} ({:.1}M px, {:.1} MB)",
+            t0.elapsed().as_millis(),
+            dem.width,
+            dem.height,
+            (dem.width as f64 * dem.height as f64) / 1e6,
+            (dem.heights.len() * 4) as f64 / 1e6,
         );
-        // Return a minimal "empty" payload: counts = 0, no data
-        let mut out = Vec::with_capacity(8);
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        return Ok(Response::new(out));
+
+        *cache.0.lock().unwrap() = Some(dem);
     }
 
-    // Also log a one-time summary line per tile
+    // ---- Subsample and serialize ----
+    let guard = cache.0.lock().unwrap();
+    let dem = guard.as_ref().unwrap();
+
+    let stride = stride.max(1) as usize;
+    let out_w = (dem.width as usize + stride - 1) / stride;
+    let out_h = (dem.height as usize + stride - 1) / stride;
+
+    let t1 = std::time::Instant::now();
+    let mut out = Vec::with_capacity(40 + out_w * out_h * 4);
+    out.extend_from_slice(&(out_w as u32).to_le_bytes());
+    out.extend_from_slice(&(out_h as u32).to_le_bytes());
+    out.extend_from_slice(&dem.west.to_le_bytes());
+    out.extend_from_slice(&dem.south.to_le_bytes());
+    out.extend_from_slice(&dem.east.to_le_bytes());
+    out.extend_from_slice(&dem.north.to_le_bytes());
+
+    let src_w = dem.width as usize;
+    let src_h = dem.height as usize;
+    for j in 0..out_h {
+        let py = (j * stride).min(src_h - 1);
+        let row = py * src_w;
+        for i in 0..out_w {
+            let px = (i * stride).min(src_w - 1);
+            out.extend_from_slice(&dem.heights[row + px].to_le_bytes());
+        }
+    }
+
     println!(
-        "[terrain] {}/{}/{}: verts={}, idx={}, min={:.1}, max={:.1}",
-        zoom, x, y, vcount, icount, mesh.header.min_height, mesh.header.max_height
+        "[dem] subsample stride={} → {}×{} in {} ms",
+        stride,
+        out_w,
+        out_h,
+        t1.elapsed().as_millis()
     );
-
-    let min_h = mesh.header.min_height as f64;
-    let max_h = mesh.header.max_height as f64;
-    let span = (max_h - min_h).max(1e-6);
-
-    let mut out: Vec<u8> = Vec::with_capacity(8 + vcount * 12 + icount * 4);
-    out.extend_from_slice(&(vcount as u32).to_le_bytes());
-    out.extend_from_slice(&(icount as u32).to_le_bytes());
-
-    for i in 0..vcount {
-        // u,v in [0, 32767] → [-1, 1] scene units
-        let u = (mesh.vertices.u[i] as f32 / 32767.0) * 2.0 - 1.0;
-        let v = (mesh.vertices.v[i] as f32 / 32767.0) * 2.0 - 1.0;
-        // height in metres (absolute)
-        let h = min_h as f32 + (mesh.vertices.height[i] as f32 / 32767.0) * span as f32;
-        out.extend_from_slice(&u.to_le_bytes());
-        out.extend_from_slice(&h.to_le_bytes()); // Y = elevation
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    for idx in &mesh.indices {
-        out.extend_from_slice(&idx.to_le_bytes());
-    }
 
     Ok(Response::new(out))
 }

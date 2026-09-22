@@ -24,7 +24,6 @@
   "bundle": {
     "active": true,
     "resources": [
-        "resources/terrain/srtm_tiles",
         "resources/dem/imphal_full.tif"
       ],
     "targets": "all",
