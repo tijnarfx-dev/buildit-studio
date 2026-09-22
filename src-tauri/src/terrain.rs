@@ -180,12 +180,30 @@ pub async fn get_terrain_tile_mesh(
     let mesh = quantized_mesh::DecodedMesh::decode(&bytes)
         .map_err(|e| format!("decode tile {}/{}/{}: {}", zoom, x, y, e))?;
 
-    // DecodedMesh fields (per quantized-mesh 0.3):
-    //   mesh.vertices.u / .v / .height : Vec<u16>
-    //   mesh.indices                   : Vec<u32>
-    //   mesh.header.min_height/max_height : f32
+    // let vcount = mesh.vertices.u.len();
+    // let icount = mesh.indices.len();
     let vcount = mesh.vertices.u.len();
     let icount = mesh.indices.len();
+
+    // Emit-only-empty-diagnostic for tiles with < 3 vertices
+    if vcount < 3 {
+        println!(
+            "[terrain-empty] {}/{}/{}: verts={}, idx={} — skipping",
+            zoom, x, y, vcount, icount
+        );
+        // Return a minimal "empty" payload: counts = 0, no data
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        return Ok(Response::new(out));
+    }
+
+    // Also log a one-time summary line per tile
+    println!(
+        "[terrain] {}/{}/{}: verts={}, idx={}, min={:.1}, max={:.1}",
+        zoom, x, y, vcount, icount, mesh.header.min_height, mesh.header.max_height
+    );
+
     let min_h = mesh.header.min_height as f64;
     let max_h = mesh.header.max_height as f64;
     let span = (max_h - min_h).max(1e-6);

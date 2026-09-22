@@ -2,8 +2,8 @@
 // Local ENU (East-North-Up) frame centered on the valley.
 // Three.js convention: X = east, Y = up (elevation), Z = -north (so camera looking -Z faces north).
 
-export const VALLEY_CENTER_LON = 94.0;
-export const VALLEY_CENTER_LAT = 25.0;
+export const VALLEY_CENTER_LON = 93.5;   // was 94.0
+export const VALLEY_CENTER_LAT = 24.5;   // was 25.0
 
 const METERS_PER_DEG_LAT = 110_540;
 export function metersPerDegLon(latDeg: number): number {
