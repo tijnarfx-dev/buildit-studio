@@ -22,7 +22,7 @@ export function CameraReporter() {
     altitudeStore.set(camera.position.y);
 
     camera.getWorldDirection(_dir);
-    const headingRad = Math.atan2(_dir.x, _dir.z); // 0 = north (+Z), +east
+    const headingRad = Math.atan2(_dir.x, -_dir.z); // 0 = north (+Z), +east
     const deg = (THREE.MathUtils.radToDeg(headingRad) + 360) % 360;
     headingStore.set(deg);
   });

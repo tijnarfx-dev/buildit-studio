@@ -6,12 +6,15 @@ import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
 import { Terrain } from "../../core/Terrain";
 import { useDem } from "../../core/DemContext";
-import { sampleElevation, snapToGrid, worldToLonLat } from "../../core/dem";
+import { sampleElevation, snapToGrid, worldToLonLat, lonLatToWorld } from "../../core/dem";
 import { CameraHUD, CameraReporter, CompassRose } from "../../core/CameraHUD";
 import { OsmOverlay } from "../../core/OsmOverlay";
 import { GridRings } from "../../core/GridRings";
 import { CursorHUD } from "../../core/CursorHUD";
 import { cursorStore } from "../../core/hudStores";
+import { LocationLabels } from "../../core/LocationLabels";
+import { NorthArrow } from "../../core/NorthArrow";
+import { LOCATIONS } from "../../core/locations";
 
 
 import { BUILDINGS, findBuilding } from "./buildings";
@@ -54,6 +57,11 @@ export function Community() {
   const [showWater, setShowWater] = useState(true);
   const [showRail,  setShowRail]  = useState(false);
   const [showRings, setShowRings] = useState(true);
+  const [showLabels, setShowLabels] = useState(true);
+  const [showNorth,  setShowNorth]  = useState(true);
+
+  const controlsRef = useRef<any>(null);
+  const initialFocusDone = useRef(false);
 
   // ghost position ref replaces old ghost state
   const ghostPos = useRef<{ x: number; y: number; z: number; active: boolean }>({
@@ -81,6 +89,28 @@ export function Community() {
 
   useEffect(() => { setPreviewRotation(0); }, [selected]);
 
+  // On first DEM load, move the camera + orbit target to Kangla.
+  useEffect(() => {
+    if (!dem || initialFocusDone.current) return;
+    const controls = controlsRef.current;
+    if (!controls) return;
+
+    const kangla = LOCATIONS.find((l) => l.id === "kangla");
+    if (!kangla) return;
+
+    const { x, z } = lonLatToWorld(dem.bounds, kangla.lon, kangla.lat);
+    const groundY = sampleElevation(dem, x, z);
+
+    const target = new THREE.Vector3(x, groundY + 500, z);
+    const cameraOffset = new THREE.Vector3(0, 8000, 8000); // same offset as before
+
+    controls.target.copy(target);
+    controls.object.position.copy(target).add(cameraOffset);
+    controls.update();
+
+    initialFocusDone.current = true;
+  }, [dem]);
+
   // ---- Terrain events ----
   const handlePointerDown = (e: React.PointerEvent) => {
     downPos.current = { x: e.clientX, y: e.clientY };
@@ -95,16 +125,6 @@ export function Community() {
     if (wasDrag) ghostPos.current.active = false; // deactivate ghost if drag
   };
 
-  // const handlePointerMove = (world: THREE.Vector3) => {
-  //   if (!dem || !selected) { ghostPos.current.active = false; return; }
-  //   const x = snapToGrid(world.x, GRID_SIZE);
-  //   const z = snapToGrid(world.z, GRID_SIZE);
-  //   const y = sampleElevation(dem, x, z);
-  //   ghostPos.current.x = x;
-  //   ghostPos.current.y = y;
-  //   ghostPos.current.z = z;
-  //   ghostPos.current.active = true;
-  // };
   const handlePointerMove = (world: THREE.Vector3) => {
     if (!dem) return;
 
@@ -216,12 +236,12 @@ export function Community() {
       {/* ---- HUD ---- */}
       <div style={hudStyle}>
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Community Edition</div>
-        <div style={{ marginBottom: 8, fontSize: 12 }}>
+        {/* <div style={{ marginBottom: 8, fontSize: 12 }}>
           Cash: <b>${cash.toLocaleString()}</b> · Buildings: <b>{placed.length}</b>
         </div>
 
-        <div style={{ marginBottom: 8, fontSize: 12 }}>Build:</div>
-        {BUILDINGS.map((b) => (
+        <div style={{ marginBottom: 8, fontSize: 12 }}>Build:</div> */}
+        {/* {BUILDINGS.map((b) => (
           <button
             key={b.id}
             onClick={() => setSelected(selected === b.id ? null : b.id)}
@@ -235,13 +255,13 @@ export function Community() {
           >
             {b.name} — ${b.cost}
           </button>
-        ))}
+        ))} */}
 
-        <hr style={{ margin: "10px 0" }} />
+        {/* <hr style={{ margin: "10px 0" }} /> */}
 
-        <button onClick={saveCity} style={btnStyle}>Save</button>
+        {/* <button onClick={saveCity} style={btnStyle}>Save</button>
         <button onClick={loadCity} style={btnStyle}>Load</button>
-        <button onClick={clearCity} style={btnStyle}>Clear</button>
+        <button onClick={clearCity} style={btnStyle}>Clear</button> */}
 
         <hr style={{ margin: "10px 0" }} />
 
@@ -279,6 +299,23 @@ export function Community() {
           Distance rings
         </label>
 
+        <label style={cbRowStyle}>
+        <input
+          type="checkbox"
+          checked={showLabels}
+          onChange={(e) => setShowLabels(e.target.checked)}
+        />
+        Place labels
+      </label>
+      <label style={cbRowStyle}>
+        <input
+          type="checkbox"
+          checked={showNorth}
+          onChange={(e) => setShowNorth(e.target.checked)}
+        />
+        North arrow
+      </label>
+
         {status && (
           <div style={{ marginTop: 8, fontSize: 11, color: "#333" }}>{status}</div>
         )}
@@ -313,6 +350,8 @@ export function Community() {
         />
         <GridRings visible={showRings} />
         <OsmOverlay visible={{ roads: showRoads, water: showWater, rail: showRail }} />
+        <LocationLabels visible={showLabels} />
+        <NorthArrow visible={showNorth} />
 
         {/* Placed buildings */}
         <PlacedBuildings placed={placed} />
@@ -321,6 +360,7 @@ export function Community() {
         <Ghost posRef={ghostPos} typeId={selected} rotationY={previewRotation} />
 
         <OrbitControls
+          ref={controlsRef}
           makeDefault
           target={[0, 800, 0]}
           maxPolarAngle={Math.PI / 2.15}

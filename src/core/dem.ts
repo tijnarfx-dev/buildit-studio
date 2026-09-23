@@ -44,7 +44,7 @@ export function worldToLonLat(b: DemBounds, x: number, z: number) {
   const mLon = metersPerDegLon(b.centerLat);
   return {
     lon: b.centerLon + x / mLon,
-    lat: b.centerLat + z / METERS_PER_DEG_LAT,
+    lat: b.centerLat - z / METERS_PER_DEG_LAT,
   };
 }
 
@@ -52,7 +52,7 @@ export function lonLatToWorld(b: DemBounds, lon: number, lat: number) {
   const mLon = metersPerDegLon(b.centerLat);
   return {
     x: (lon - b.centerLon) * mLon,
-    z: (lat - b.centerLat) * METERS_PER_DEG_LAT,
+    z: (b.centerLat - lat) * METERS_PER_DEG_LAT,
   };
 }
 
@@ -60,7 +60,7 @@ export function lonLatToWorld(b: DemBounds, lon: number, lat: number) {
 export function sampleElevation(dem: DemData, x: number, z: number): number {
   const { bounds, width, height, heights } = dem;
   const u = (x / bounds.widthM) + 0.5;   // [0,1] from west to east
-  const v = 0.5 - (z / bounds.depthM);   // [0,1] from north to south
+  const v = 0.5 + (z / bounds.depthM);   // [0,1] from north to south
 
   const fx = Math.min(Math.max(u, 0), 1) * (width - 1);
   const fy = Math.min(Math.max(v, 0), 1) * (height - 1);

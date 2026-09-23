@@ -15,7 +15,7 @@ from PIL import Image
 # OUT_PATH    = Path(r"src-tauri\resources\dem\imphal_texture.jpg")
 
 SAFE_DIR = Path("/mnt/c/users/john/data/imphal_valley/copernicus/sentinel2")
-DEM_PATH = Path("/mnt/c/users/john/data/imphal_valley/copernicus/dem/imphal_merged_dem.tif")
+DEM_PATH = Path("/mnt/c/users/john/data/imphal_valley/copernicus/dem/imphal_full.tif")
 OUT_PATH = Path("src-tauri/resources/dem/imphal_texture.jpg")
 TARGET_SIZE = 4096
 

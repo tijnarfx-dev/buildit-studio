@@ -2,6 +2,8 @@ Directory structure:
 └── buildit-studio/
     ├── README.md
     ├── index.html
+    ├── NOTICE.md
+    ├── osm_prep.py
     ├── package.json
     ├── postcss.config.mjs
     ├── sentinel_prep.py
@@ -16,8 +18,15 @@ Directory structure:
     │   ├── vite-env.d.ts
     │   ├── core/
     │   │   ├── CameraHUD.tsx
+    │   │   ├── CursorHUD.tsx
     │   │   ├── dem.ts
     │   │   ├── DemContext.tsx
+    │   │   ├── GridRings.tsx
+    │   │   ├── hudStores.ts
+    │   │   ├── LocationLabels.tsx
+    │   │   ├── locations.ts
+    │   │   ├── NorthArrow.tsx
+    │   │   ├── OsmOverlay.tsx
     │   │   ├── setupBVH.ts
     │   │   └── Terrain.tsx
     │   └── editions/
@@ -37,6 +46,7 @@ Directory structure:
         └── src/
             ├── lib.rs
             ├── main.rs
+            ├── osm.rs
             └── terrain.rs
 
 ================================================
@@ -70,6 +80,265 @@ FILE: index.html
   </body>
 </html>
 
+
+
+================================================
+FILE: NOTICE.md
+================================================
+# NOTICE — Third-party data attribution
+
+BuildIt Studio bundles third-party geospatial data. These notices must be
+preserved in any distribution and shown in an "About" screen before public
+release.
+
+## Copernicus DEM
+
+> © DLR e.V. 2010-2014 and © Airbus Defence and Space GmbH 2014-2018,
+> provided under COPERNICUS by the European Union and ESA. All rights reserved.
+
+## Sentinel-2
+
+> Contains modified Copernicus Sentinel data 2011, and 2026.
+
+## OpenStreetMap
+
+Vector overlays (roads, waterways, railways) are derived from OpenStreetMap.
+
+> © OpenStreetMap contributors, ODbL 1.0
+> https://www.openstreetmap.org/copyright
+> https://opendatacommons.org/licenses/odbl/1-0/
+
+
+
+================================================
+FILE: osm_prep.py
+================================================
+"""
+Preprocess OpenStreetMap data for Imphal Valley into a bundled GeoJSON overlay.
+
+Run once on a dev machine with internet:
+    python osm_prep.py
+
+Outputs:
+    src-tauri/resources/osm/imphal_osm.geojson
+    src-tauri/resources/osm/imphal_osm.meta.json
+
+To force a fresh Overpass query, delete:
+    osm_cache/overpass_raw.json
+
+Attribution: © OpenStreetMap contributors, ODbL 1.0 — see NOTICE.md
+"""
+from __future__ import annotations
+
+import json
+import math
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from shapely.geometry import LineString
+
+# ---------------------------------------------------------------------------
+# Bounds — must match src-tauri/src/terrain.rs (west/south/east/north).
+# ---------------------------------------------------------------------------
+WEST  = 92.9998611
+SOUTH = 23.9998611
+EAST  = 95.0004166
+NORTH = 25.0001389
+
+OVERPASS_URL = "https://overpass-api.de/api/interpreter"
+
+ROAD_CLASSES = [
+    "motorway", "trunk", "primary", "secondary",
+    "tertiary", "unclassified", "residential", "service",
+]
+WATER_CLASSES = ["river", "stream", "canal"]
+
+# Simplification tolerances (meters). Bigger → smaller file, less detail.
+SIMPLIFY_ROADS_M = 10.0
+SIMPLIFY_WATER_M = 25.0
+SIMPLIFY_RAIL_M  = 15.0
+
+OUT_DIR     = Path("src-tauri/resources/osm")
+OUT_GEOJSON = OUT_DIR / "imphal_osm.geojson"
+OUT_META    = OUT_DIR / "imphal_osm.meta.json"
+CACHE_RAW   = Path("osm_cache/overpass_raw.json")
+
+COORD_DECIMALS = 5   # ~1 m at this latitude
+
+
+# ---------------------------------------------------------------------------
+# Overpass
+# ---------------------------------------------------------------------------
+def build_query() -> str:
+    bbox = f"{SOUTH},{WEST},{NORTH},{EAST}"
+    roads_re = "|".join(ROAD_CLASSES)
+    water_re = "|".join(WATER_CLASSES)
+    return f"""
+[out:json][timeout:180];
+(
+  way["highway"~"^({roads_re})$"]({bbox});
+  way["waterway"~"^({water_re})$"]({bbox});
+  way["railway"="rail"]({bbox});
+);
+out geom;
+""".strip()
+
+
+def fetch_overpass() -> dict:
+    if CACHE_RAW.exists():
+        print(f"[osm] using cached response: {CACHE_RAW}")
+        return json.loads(CACHE_RAW.read_text())
+
+    q = build_query()
+    print(f"[osm] querying Overpass ({len(q)} chars)...")
+    body = urllib.parse.urlencode({"data": q}).encode()
+    req = urllib.request.Request(
+        OVERPASS_URL,
+        data=body,
+        headers={
+            "User-Agent": "buildit-studio-osm-prep/0.1 (offline desktop app)",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=240) as r:
+        raw = r.read()
+    print(f"[osm] got {len(raw) / 1e6:.2f} MB in {time.time() - t0:.1f}s")
+
+    CACHE_RAW.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_RAW.write_bytes(raw)
+    return json.loads(raw)
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+def classify(tags: dict) -> tuple[str, str] | None:
+    hw = tags.get("highway")
+    ww = tags.get("waterway")
+    rw = tags.get("railway")
+
+    if hw in ROAD_CLASSES:
+        tier = "major" if hw in ("motorway", "trunk", "primary", "secondary") else "minor"
+        return ("road", tier)
+    if ww in WATER_CLASSES:
+        return ("water", ww)
+    if rw == "rail":
+        return ("rail", "rail")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
+def way_coords_lonlat(way: dict):
+    geom = way.get("geometry")
+    if not geom:
+        return None
+    pts = [(g["lon"], g["lat"]) for g in geom if "lon" in g and "lat" in g]
+    return pts if len(pts) >= 2 else None
+
+
+def simplify_lonlat(coords, tol_m: float):
+    """Simplify a lon/lat polyline with a tolerance given in meters."""
+    mean_lat = sum(c[1] for c in coords) / len(coords)
+    mlon = 111_320.0 * math.cos(math.radians(mean_lat))
+    mlat = 110_540.0
+
+    line = LineString([(x * mlon, y * mlat) for (x, y) in coords])
+    s = line.simplify(tol_m, preserve_topology=True)
+    if s.is_empty or s.geom_type != "LineString" or len(s.coords) < 2:
+        return None
+
+    inv_lon, inv_lat = 1.0 / mlon, 1.0 / mlat
+    r = COORD_DECIMALS
+    return [[round(x * inv_lon, r), round(y * inv_lat, r)] for (x, y) in s.coords]
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    data = fetch_overpass()
+    elems = data.get("elements", [])
+    print(f"[osm] {len(elems)} elements from Overpass")
+
+    features: list[dict] = []
+    counts: dict[tuple[str, str], int] = {}
+    verts_in = verts_out = 0
+
+    for el in elems:
+        if el.get("type") != "way":
+            continue
+        tags = el.get("tags") or {}
+        cls = classify(tags)
+        if cls is None:
+            continue
+        kind, subkind = cls
+
+        coords = way_coords_lonlat(el)
+        if coords is None:
+            continue
+
+        tol = (
+            SIMPLIFY_ROADS_M if kind == "road"
+            else SIMPLIFY_WATER_M if kind == "water"
+            else SIMPLIFY_RAIL_M
+        )
+        simple = simplify_lonlat(coords, tol)
+        if simple is None:
+            continue
+
+        verts_in += len(coords)
+        verts_out += len(simple)
+
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "kind": kind,
+                "subkind": subkind,
+                "name": tags.get("name"),
+                "ref": tags.get("ref"),
+            },
+            "geometry": {"type": "LineString", "coordinates": simple},
+        })
+        counts[(kind, subkind)] = counts.get((kind, subkind), 0) + 1
+
+    print(f"[osm] kept {len(features)} features")
+    print(f"[osm] vertices: {verts_in:,} -> {verts_out:,} "
+          f"({100 * verts_out / max(1, verts_in):.1f}%)")
+    for k in sorted(counts):
+        print(f"       {k[0]:5s} {k[1]:12s} {counts[k]:6d}")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    OUT_GEOJSON.write_text(
+        json.dumps({"type": "FeatureCollection", "features": features},
+                   separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    meta = {
+        "source": "OpenStreetMap via Overpass API",
+        "overpass_url": OVERPASS_URL,
+        "extracted_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "bbox": {"west": WEST, "south": SOUTH, "east": EAST, "north": NORTH},
+        "attribution": "© OpenStreetMap contributors, ODbL 1.0",
+        "license_url": "https://opendatacommons.org/licenses/odbl/1-0/",
+        "feature_counts": {f"{k[0]}/{k[1]}": v for k, v in counts.items()},
+        "simplify_tolerance_m": {
+            "road": SIMPLIFY_ROADS_M, "water": SIMPLIFY_WATER_M, "rail": SIMPLIFY_RAIL_M,
+        },
+    }
+    OUT_META.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    print(f"[osm] wrote {OUT_GEOJSON} ({OUT_GEOJSON.stat().st_size / 1e6:.2f} MB)")
+    print(f"[osm] wrote {OUT_META}")
+
+
+if __name__ == "__main__":
+    main()
 
 
 ================================================
@@ -142,7 +411,7 @@ from PIL import Image
 # OUT_PATH    = Path(r"src-tauri\resources\dem\imphal_texture.jpg")
 
 SAFE_DIR = Path("/mnt/c/users/john/data/imphal_valley/copernicus/sentinel2")
-DEM_PATH = Path("/mnt/c/users/john/data/imphal_valley/copernicus/dem/imphal_merged_dem.tif")
+DEM_PATH = Path("/mnt/c/users/john/data/imphal_valley/copernicus/dem/imphal_full.tif")
 OUT_PATH = Path("src-tauri/resources/dem/imphal_texture.jpg")
 TARGET_SIZE = 4096
 
@@ -334,6 +603,10 @@ FILE: .gitingestignore
 ================================================
 src-tauri/resources/terrain/
 resources/terrain/
+src-tauri/resources/dem/
+resources/dem/
+src-tauri/resources/osm/
+resources/osm/
 
 
 
@@ -509,20 +782,14 @@ FILE: src/core/CameraHUD.tsx
 // src/core/CameraHUD.tsx
 import { useEffect, useRef, useState } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
+import * as THREE from "three";
+import { altitudeStore, headingStore } from "./hudStores";
 
-// Tiny external store — one writer (R3F), one reader (React DOM).
-const store = {
-  value: 0,
-  listeners: new Set<(v: number) => void>(),
-  set(v: number) {
-    this.value = v;
-    this.listeners.forEach((fn) => fn(v));
-  },
-};
+const _dir = new THREE.Vector3();
 
 /**
- * Must be placed INSIDE <Canvas>. Samples camera Y each frame and pushes
- * to the shared store at ~15 Hz (no per-frame React re-renders).
+ * Must be placed INSIDE <Canvas>. Pushes camera altitude + heading to the
+ * shared stores at ~15 Hz (no per-frame React re-renders).
  */
 export function CameraReporter() {
   const { camera } = useThree();
@@ -530,39 +797,34 @@ export function CameraReporter() {
 
   useFrame((_, delta) => {
     lastPush.current += delta;
-    if (lastPush.current < 1 / 15) return;   // throttle to 15 Hz
+    if (lastPush.current < 1 / 15) return;
     lastPush.current = 0;
-    store.set(camera.position.y);
+
+    altitudeStore.set(camera.position.y);
+
+    camera.getWorldDirection(_dir);
+    const headingRad = Math.atan2(_dir.x, -_dir.z); // 0 = north (+Z), +east
+    const deg = (THREE.MathUtils.radToDeg(headingRad) + 360) % 360;
+    headingStore.set(deg);
   });
 
   return null;
 }
 
-/**
- * Renders outside the Canvas. Reads from the shared store.
- */
 export function CameraHUD({
   groundElevation,
 }: {
   groundElevation: number | null;
 }) {
-  const [alt, setAlt] = useState(store.value);
+  const [alt, setAlt] = useState(altitudeStore.value);
 
-  useEffect(() => {
-    store.listeners.add(setAlt);
-    return () => {
-      store.listeners.delete(setAlt);
-    };
-  }, []);
+  useEffect(() => altitudeStore.subscribe(setAlt), []);
 
   const altAboveGround =
     groundElevation != null ? Math.max(0, alt - groundElevation) : null;
 
-  // Format helpers
   const fmt = (m: number) =>
-    Math.abs(m) >= 1000
-      ? `${(m / 1000).toFixed(2)} km`
-      : `${m.toFixed(0)} m`;
+    Math.abs(m) >= 1000 ? `${(m / 1000).toFixed(2)} km` : `${m.toFixed(0)} m`;
 
   return (
     <div style={hudBoxStyle}>
@@ -576,11 +838,78 @@ export function CameraHUD({
           <span style={hudValueStyle}>{fmt(altAboveGround)}</span>
         </div>
       )}
-      <div style={hudRowStyle}>
-        <span style={hudLabelStyle}>Scale ref</span>
-        <span style={{ ...hudValueStyle, fontSize: 11, color: "#666" }}>
-          1 km ≈ {Math.round(1000 / Math.max(1, alt / 100))} screen units
-        </span>
+    </div>
+  );
+}
+
+export function CompassRose() {
+  const [heading, setHeading] = useState(headingStore.value);
+  useEffect(() => headingStore.subscribe(setHeading), []);
+
+  const ticks = [];
+  for (let i = 0; i < 24; i++) {
+    const a = i * 15;
+    const isCardinal = a % 90 === 0;
+    const isMajor = a % 45 === 0;
+    const r1 = 34;
+    const r2 = isCardinal ? 23 : isMajor ? 27 : 30;
+    const rad = ((a - 90) * Math.PI) / 180;
+    ticks.push(
+      <line
+        key={i}
+        x1={Math.cos(rad) * r1}
+        y1={Math.sin(rad) * r1}
+        x2={Math.cos(rad) * r2}
+        y2={Math.sin(rad) * r2}
+        stroke="#333"
+        strokeWidth={isCardinal ? 1.5 : 0.6}
+      />,
+    );
+  }
+
+  return (
+    <div style={compassBoxStyle}>
+      <svg width={76} height={76} viewBox="-38 -38 76 76">
+        <circle
+          r={35}
+          fill="rgba(255,255,255,0.92)"
+          stroke="#333"
+          strokeWidth={1}
+        />
+        <g transform={`rotate(${-heading})`}>
+          {ticks}
+          <text
+            x={0}
+            y={-25}
+            textAnchor="middle"
+            fontSize={11}
+            fontWeight={700}
+            fill="#c0392b"
+          >
+            N
+          </text>
+          <text x={25} y={4} textAnchor="middle" fontSize={9} fill="#333">
+            E
+          </text>
+          <text x={0} y={32} textAnchor="middle" fontSize={9} fill="#333">
+            S
+          </text>
+          <text x={-25} y={4} textAnchor="middle" fontSize={9} fill="#333">
+            W
+          </text>
+        </g>
+        <polygon points="0,-35 -4,-29 4,-29" fill="#c0392b" />
+      </svg>
+      <div
+        style={{
+          fontSize: 10,
+          textAlign: "center",
+          color: "#666",
+          marginTop: 2,
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {heading.toFixed(0)}°
       </div>
     </div>
   );
@@ -610,11 +939,96 @@ const hudRowStyle: React.CSSProperties = {
   padding: "2px 0",
 };
 
-const hudLabelStyle: React.CSSProperties = {
-  color: "#666",
-};
+const hudLabelStyle: React.CSSProperties = { color: "#666" };
 
 const hudValueStyle: React.CSSProperties = {
+  fontWeight: 600,
+  color: "#111",
+  fontVariantNumeric: "tabular-nums",
+};
+
+const compassBoxStyle: React.CSSProperties = {
+  position: "absolute",
+  bottom: 16,
+  right: 16,
+  zIndex: 10,
+  padding: 4,
+  borderRadius: 40,
+  background: "rgba(255,255,255,0.92)",
+  boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+  backdropFilter: "blur(4px)",
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+};
+
+
+================================================
+FILE: src/core/CursorHUD.tsx
+================================================
+// src/core/CursorHUD.tsx
+import { useEffect, useState } from "react";
+import { cursorStore, type CursorInfo } from "./hudStores";
+
+const fmtLat = (v: number) => `${Math.abs(v).toFixed(5)}° ${v >= 0 ? "N" : "S"}`;
+const fmtLon = (v: number) => `${Math.abs(v).toFixed(5)}° ${v >= 0 ? "E" : "W"}`;
+
+export function CursorHUD() {
+  const [c, setC] = useState<CursorInfo>(cursorStore.value);
+  useEffect(() => cursorStore.subscribe(setC), []);
+
+  return (
+    <div style={boxStyle}>
+      <div style={rowStyle}>
+        <span style={labelStyle}>World</span>
+        <span style={valueStyle}>
+          {c.active ? `${c.x.toFixed(0)}, ${c.z.toFixed(0)}` : "—"}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Lat</span>
+        <span style={valueStyle}>{c.active ? fmtLat(c.lat) : "—"}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Lon</span>
+        <span style={valueStyle}>{c.active ? fmtLon(c.lon) : "—"}</span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Slope</span>
+        <span style={valueStyle}>
+          {c.active ? `${c.slopeDeg.toFixed(1)}°` : "—"}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+const boxStyle: React.CSSProperties = {
+  position: "absolute",
+  top: 12,
+  right: 12,
+  zIndex: 10,
+  background: "rgba(255, 255, 255, 0.92)",
+  padding: "8px 12px",
+  borderRadius: 6,
+  fontFamily: "system-ui, sans-serif",
+  fontSize: 12,
+  boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+  minWidth: 190,
+  backdropFilter: "blur(4px)",
+};
+
+const rowStyle: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 12,
+  padding: "2px 0",
+};
+
+const labelStyle: React.CSSProperties = { color: "#666" };
+
+const valueStyle: React.CSSProperties = {
   fontWeight: 600,
   color: "#111",
   fontVariantNumeric: "tabular-nums",
@@ -670,7 +1084,7 @@ export function worldToLonLat(b: DemBounds, x: number, z: number) {
   const mLon = metersPerDegLon(b.centerLat);
   return {
     lon: b.centerLon + x / mLon,
-    lat: b.centerLat + z / METERS_PER_DEG_LAT,
+    lat: b.centerLat - z / METERS_PER_DEG_LAT,
   };
 }
 
@@ -678,7 +1092,7 @@ export function lonLatToWorld(b: DemBounds, lon: number, lat: number) {
   const mLon = metersPerDegLon(b.centerLat);
   return {
     x: (lon - b.centerLon) * mLon,
-    z: (lat - b.centerLat) * METERS_PER_DEG_LAT,
+    z: (b.centerLat - lat) * METERS_PER_DEG_LAT,
   };
 }
 
@@ -740,6 +1154,502 @@ export const useDem = () => useContext(DemContext);
 
 
 ================================================
+FILE: src/core/GridRings.tsx
+================================================
+// src/core/GridRings.tsx
+import { useMemo, useRef } from "react";
+import { useFrame, useThree } from "@react-three/fiber";
+import * as THREE from "three";
+import { useDem } from "./DemContext";
+import { sampleElevation } from "./dem";
+
+const RING_RADII_M = [1000, 5000, 10000];
+const SEGMENTS = 96;
+const ELEV_OFFSET = 8;
+
+interface Ring {
+  radius: number;
+  geom: THREE.BufferGeometry;
+}
+
+export function GridRings({ visible = true }: { visible?: boolean }) {
+  const { dem } = useDem();
+  const controls = useThree((s) => s.controls) as
+    | { target: THREE.Vector3 }
+    | null;
+
+  const rings: Ring[] | null = useMemo(() => {
+    if (!dem) return null;
+    return RING_RADII_M.map((radius) => {
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(SEGMENTS * 3), 3),
+      );
+      geom.computeBoundingSphere();
+      return { radius, geom };
+    });
+  }, [dem]);
+
+  const lastCenter = useRef(new THREE.Vector3(NaN, 0, NaN));
+
+  useFrame(() => {
+    if (!dem || !rings) return;
+
+    const cx = controls?.target.x ?? 0;
+    const cz = controls?.target.z ?? 0;
+
+    // Rebuild only if the target moved > 1 m.
+    if (
+      Math.abs(lastCenter.current.x - cx) < 1 &&
+      Math.abs(lastCenter.current.z - cz) < 1
+    )
+      return;
+    lastCenter.current.set(cx, 0, cz);
+
+    for (const { radius, geom } of rings) {
+      const attr = geom.attributes.position as THREE.BufferAttribute;
+      const arr = attr.array as Float32Array;
+      for (let i = 0; i < SEGMENTS; i++) {
+        const a = (i / SEGMENTS) * Math.PI * 2;
+        const x = cx + Math.cos(a) * radius;
+        const z = cz + Math.sin(a) * radius;
+        const y = sampleElevation(dem, x, z) + ELEV_OFFSET;
+        arr[i * 3] = x;
+        arr[i * 3 + 1] = y;
+        arr[i * 3 + 2] = z;
+      }
+      attr.needsUpdate = true;
+      geom.computeBoundingSphere();
+    }
+  });
+
+  if (!rings || !visible) return null;
+
+  return (
+    <>
+      {rings.map(({ radius, geom }) => (
+        <lineLoop key={radius} geometry={geom} frustumCulled={false}>
+          <lineBasicMaterial
+            color="#ffffff"
+            transparent
+            opacity={0.55}
+            depthWrite={false}
+          />
+        </lineLoop>
+      ))}
+    </>
+  );
+}
+
+
+================================================
+FILE: src/core/hudStores.ts
+================================================
+// src/core/hudStores.ts
+// Shared external stores — writer is inside R3F, readers are React DOM.
+// Same pattern as the original CameraHUD store, generalized.
+
+type Store<T> = {
+  value: T;
+  listeners: Set<(v: T) => void>;
+  set(v: T): void;
+  subscribe(fn: (v: T) => void): () => void;
+};
+
+function createStore<T>(initial: T): Store<T> {
+  return {
+    value: initial,
+    listeners: new Set(),
+    set(v: T) {
+      this.value = v;
+      this.listeners.forEach((fn) => fn(v));
+    },
+    subscribe(fn) {
+      this.listeners.add(fn);
+      return () => {
+        this.listeners.delete(fn);
+      };
+    },
+  };
+}
+
+export const altitudeStore = createStore<number>(0);
+
+/** Heading in degrees: 0 = north, 90 = east, increases clockwise. */
+export const headingStore = createStore<number>(0);
+
+export interface CursorInfo {
+  active: boolean;
+  x: number;
+  z: number;
+  elevation: number;
+  lon: number;
+  lat: number;
+  slopeDeg: number;
+}
+
+export const cursorStore = createStore<CursorInfo>({
+  active: false,
+  x: 0,
+  z: 0,
+  elevation: 0,
+  lon: 0,
+  lat: 0,
+  slopeDeg: 0,
+});
+
+
+================================================
+FILE: src/core/LocationLabels.tsx
+================================================
+// src/core/LocationLabels.tsx
+import { Html } from "@react-three/drei";
+import * as THREE from "three";
+import { useThree } from "@react-three/fiber";
+import { useDem } from "./DemContext";
+import { lonLatToWorld, sampleElevation } from "./dem";
+import { LOCATIONS, type LocationKind } from "./locations";
+
+const STYLE: Record<
+  LocationKind,
+  { bg: string; fg: string; border: string; weight: number; font: number }
+> = {
+  city:     { bg: "#ffffff", fg: "#111",    border: "#222",    weight: 700, font: 12 },
+  town:     { bg: "#ffffff", fg: "#222",    border: "#777",    weight: 600, font: 11 },
+  district: { bg: "#f6f6f6", fg: "#333",    border: "#aaa",    weight: 500, font: 10 },
+  landmark: { bg: "#fffbe6", fg: "#7a5c00", border: "#d4a800", weight: 600, font: 11 },
+  lake:     { bg: "#e8f4fb", fg: "#0b5a8a", border: "#3a9ad9", weight: 600, font: 11 },
+};
+
+const ELEV_OFFSET = 50; // meters above terrain
+
+export function LocationLabels({ visible = true }: { visible?: boolean }) {
+  const { dem } = useDem();
+  const camera = useThree((s) => s.camera);
+  const controls = useThree((s) => s.controls) as
+    | { target: THREE.Vector3; update: () => void }
+    | null;
+
+  if (!dem || !visible) return null;
+
+  const handleClick = (x: number, y: number, z: number) => {
+    if (!controls) return;
+    const delta = new THREE.Vector3(x, y, z).sub(controls.target);
+    controls.target.add(delta);
+    camera.position.add(delta);
+    controls.update();
+  };
+
+  return (
+    <>
+      {LOCATIONS.map((loc) => {
+        const { x, z } = lonLatToWorld(dem.bounds, loc.lon, loc.lat);
+        const groundY = sampleElevation(dem, x, z);
+        const y = groundY + ELEV_OFFSET;
+        const s = STYLE[loc.kind];
+        return (
+          <Html
+            key={loc.id}
+            position={[x, y, z]}
+            center
+            zIndexRange={[5, 0]}
+            style={{ pointerEvents: "none", userSelect: "none" }}
+          >
+            <div
+              onClick={(e) => {
+                e.stopPropagation();
+                handleClick(x, groundY, z);
+              }}
+              onPointerDown={(e) => e.stopPropagation()}
+              style={{
+                background: s.bg,
+                color: s.fg,
+                border: `1px solid ${s.border}`,
+                borderRadius: 4,
+                padding: "1px 6px",
+                fontFamily: "system-ui, sans-serif",
+                fontSize: s.font,
+                fontWeight: s.weight,
+                lineHeight: 1.25,
+                whiteSpace: "nowrap",
+                boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
+                cursor: "pointer",
+                pointerEvents: "auto",
+              }}
+              title={`${loc.name} — ${loc.lat.toFixed(4)}N, ${loc.lon.toFixed(4)}E (click to focus)`}
+            >
+              {loc.name}
+            </div>
+          </Html>
+        );
+      })}
+    </>
+  );
+}
+
+
+================================================
+FILE: src/core/locations.ts
+================================================
+// src/core/locations.ts
+// Curated label list for Imphal Valley. lon/lat are WGS84 decimal degrees.
+// Coordinates are approximate (±~500 m) — edit freely, hot-reloads in dev.
+
+export type LocationKind = "city" | "town" | "district" | "landmark" | "lake";
+
+export interface LocationLabel {
+  id: string;
+  name: string;
+  lon: number;
+  lat: number;
+  kind: LocationKind;
+}
+
+export const LOCATIONS: LocationLabel[] = [
+  // --- Core city + wards ---
+  { id: "imphal",         name: "Imphal",            lon: 93.9442, lat: 24.8083, kind: "city"     },
+  { id: "kangla",         name: "Kangla Fort",       lon: 93.9389, lat: 24.8069, kind: "landmark" },
+  { id: "ima-keithel",    name: "Ima Keithel",       lon: 93.9436, lat: 24.8080, kind: "landmark" },
+  { id: "uripok",         name: "Uripok",            lon: 93.9242, lat: 24.8092, kind: "district" },
+  { id: "sagolband",      name: "Sagolband",         lon: 93.9181, lat: 24.7994, kind: "district" },
+  { id: "thangmeiband",   name: "Thangmeiband",      lon: 93.9217, lat: 24.8144, kind: "district" },
+  { id: "singjamei",      name: "Singjamei",         lon: 93.9194, lat: 24.7861, kind: "district" },
+  { id: "kwakeithel",     name: "Kwakeithel",        lon: 93.9083, lat: 24.7917, kind: "district" },
+  { id: "wangkei",        name: "Wangkhei",          lon: 93.9486, lat: 24.7950, kind: "district" },
+  { id: "porompat",       name: "Porompat",          lon: 93.9711, lat: 24.7964, kind: "district" },
+  { id: "mantripukhri",   name: "Mantripukhri",      lon: 93.9389, lat: 24.8311, kind: "town"     },
+
+  // --- Towns in greater Imphal ---
+  { id: "lilong",         name: "Lilong",            lon: 93.9667, lat: 24.6750, kind: "town"     },
+  { id: "nambol",         name: "Nambol",            lon: 93.8361, lat: 24.7031, kind: "town"     },
+  { id: "mayang-imphal",  name: "Mayang Imphal",     lon: 93.8750, lat: 24.6917, kind: "town"     },
+  { id: "wangoi",         name: "Wangoi",            lon: 93.8833, lat: 24.7250, kind: "town"     },
+
+  // --- District HQ / far valley ---
+  { id: "bishnupur",      name: "Bishnupur",         lon: 93.7667, lat: 24.6333, kind: "town"     },
+  { id: "moirang",        name: "Moirang",           lon: 93.7700, lat: 24.5000, kind: "town"     },
+  { id: "thoubal",        name: "Thoubal",           lon: 94.0167, lat: 24.6333, kind: "town"     },
+  { id: "kakching",       name: "Kakching",          lon: 93.9833, lat: 24.5000, kind: "town"     },
+  { id: "sugnu",          name: "Sugnu",             lon: 93.9500, lat: 24.4667, kind: "town"     },
+
+  // --- Landmarks ---
+  { id: "imphal-airport", name: "Imphal Airport",    lon: 93.8967, lat: 24.7600, kind: "landmark" },
+  { id: "loktak",         name: "Loktak Lake",       lon: 93.8000, lat: 24.5500, kind: "lake"     },
+];
+
+
+================================================
+FILE: src/core/NorthArrow.tsx
+================================================
+// src/core/NorthArrow.tsx
+import { Html } from "@react-three/drei";
+import { useDem } from "./DemContext";
+import { sampleElevation } from "./dem";
+
+interface Props {
+  visible?: boolean;
+  /** World-space anchor. Defaults to a spot south-west of the valley, on the hills. */
+  position?: [number, number];
+  /** Total length of the arrow shaft + head in meters. */
+  length?: number;
+}
+
+export function NorthArrow({
+  visible = true,
+  position,
+  length = 600,
+}: Props) {
+  const { dem } = useDem();
+  if (!dem || !visible) return null;
+
+  const [px, pz] = position ?? [-8_000, -25_000];
+  const py = sampleElevation(dem, px, pz);
+
+  const shaftLen = length * 0.66;
+  const headLen  = length - shaftLen;
+  const shaftW   = length * 0.12;
+  const headW    = length * 0.22;
+
+  // Layout: shaft spans z=0..shaftLen, head spans z=shaftLen..length.
+  const shaftCenterZ = -shaftLen / 2;
+  const headCenterZ  = -(shaftLen + headLen / 2);
+
+  return (
+    <group position={[px, py + 6, pz]}>
+      {/* Shaft */}
+      <mesh position={[0, 0, shaftCenterZ]}>
+        <boxGeometry args={[shaftW, 6, shaftLen]} />
+        <meshStandardMaterial color="#c0392b" />
+      </mesh>
+      {/* Head (cone rotated so apex points +Z = north) */}
+      <mesh position={[0, 0, headCenterZ]} rotation={[Math.PI / 2, 0, 0]}>
+        <coneGeometry args={[headW, headLen, 4]} />
+        <meshStandardMaterial color="#c0392b" />
+      </mesh>
+      {/* "N" label at the tip */}
+      <Html
+        position={[0, 40, length + 40]}
+        center
+        zIndexRange={[5, 0]}
+        style={{ pointerEvents: "none", userSelect: "none" }}
+      >
+        <div
+          style={{
+            background: "#c0392b",
+            color: "#fff",
+            fontWeight: 800,
+            fontFamily: "system-ui, sans-serif",
+            fontSize: 12,
+            borderRadius: 4,
+            padding: "1px 6px",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.35)",
+          }}
+        >
+          N
+        </div>
+      </Html>
+    </group>
+  );
+}
+
+
+================================================
+FILE: src/core/OsmOverlay.tsx
+================================================
+// src/core/OsmOverlay.tsx
+import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import * as THREE from "three";
+import { useDem } from "./DemContext";
+import { lonLatToWorld, sampleElevation } from "./dem";
+
+interface GeoFeature {
+  type: "Feature";
+  properties: {
+    kind: "road" | "water" | "rail";
+    subkind: string;
+    name: string | null;
+    ref: string | null;
+  };
+  geometry: { type: "LineString"; coordinates: [number, number][] };
+}
+interface GeoFC { type: "FeatureCollection"; features: GeoFeature[]; }
+
+type RGB = [number, number, number];
+const ROAD_MAJOR: RGB = [1.00, 0.72, 0.25];
+const ROAD_MINOR: RGB = [0.95, 0.88, 0.60];
+const WATER:      RGB = [0.15, 0.55, 0.85];
+const RAIL:       RGB = [0.28, 0.28, 0.30];
+
+const pickColor = (kind: string, subkind: string): RGB =>
+  kind === "road"  ? (subkind === "major" ? ROAD_MAJOR : ROAD_MINOR) :
+  kind === "water" ? WATER :
+  kind === "rail"  ? RAIL : [1, 1, 1];
+
+export interface OsmVisibility { roads: boolean; water: boolean; rail: boolean; }
+
+interface Props {
+  visible?: OsmVisibility;
+  elevationOffset?: number;
+}
+
+type Bucket = "roads" | "water" | "rail";
+
+export function OsmOverlay({
+  visible = { roads: true, water: true, rail: false },
+  elevationOffset = 6,
+}: Props) {
+  const { dem } = useDem();
+  const [raw, setRaw] = useState<GeoFC | null>(null);
+
+  useEffect(() => {
+    invoke<string>("load_osm_geojson")
+      .then((s) => {
+        const t0 = performance.now();
+        const fc = JSON.parse(s) as GeoFC;
+        console.log(
+          `[osm] parsed ${fc.features.length} features in ${(performance.now() - t0).toFixed(0)} ms`
+        );
+        setRaw(fc);
+      })
+      .catch((e) => console.error("[osm] load failed:", e));
+  }, []);
+
+  const built = useMemo(() => {
+    if (!raw || !dem) return null;
+    const t0 = performance.now();
+
+    const posB: Record<Bucket, number[]> = { roads: [], water: [], rail: [] };
+    const colB: Record<Bucket, number[]> = { roads: [], water: [], rail: [] };
+    let segs = 0;
+
+    for (const f of raw.features) {
+      const { kind, subkind } = f.properties;
+      const key: Bucket = kind === "road" ? "roads" : kind === "water" ? "water" : "rail";
+      const [r, g, b] = pickColor(kind, subkind);
+      const coords = f.geometry.coordinates;
+
+      for (let i = 0; i < coords.length - 1; i++) {
+        const [lon0, lat0] = coords[i];
+        const [lon1, lat1] = coords[i + 1];
+        const w0 = lonLatToWorld(dem.bounds, lon0, lat0);
+        const w1 = lonLatToWorld(dem.bounds, lon1, lat1);
+        const y0 = sampleElevation(dem, w0.x, w0.z) + elevationOffset;
+        const y1 = sampleElevation(dem, w1.x, w1.z) + elevationOffset;
+
+        posB[key].push(w0.x, y0, w0.z, w1.x, y1, w1.z);
+        colB[key].push(r, g, b, r, g, b);
+        segs++;
+      }
+    }
+
+    const geoms: Partial<Record<Bucket, THREE.BufferGeometry>> = {};
+    for (const key of ["roads", "water", "rail"] as const) {
+      if (posB[key].length === 0) continue;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(posB[key], 3));
+      g.setAttribute("color", new THREE.Float32BufferAttribute(colB[key], 3));
+      g.computeBoundingSphere();
+      geoms[key] = g;
+    }
+
+    console.log(
+      `[osm] built ${segs} segments ` +
+      `(roads=${posB.roads.length / 6}, water=${posB.water.length / 6}, rail=${posB.rail.length / 6}) ` +
+      `in ${(performance.now() - t0).toFixed(0)} ms`
+    );
+    return geoms;
+  }, [raw, dem, elevationOffset]);
+
+  useEffect(() => {
+    return () => { if (built) for (const g of Object.values(built)) g.dispose(); };
+  }, [built]);
+
+  if (!built) return null;
+
+  return (
+    <>
+      {(["roads", "water", "rail"] as const).map((key) => {
+        const g = built[key];
+        if (!g) return null;
+        return (
+          <lineSegments key={key} geometry={g} visible={visible[key]}>
+            <lineBasicMaterial
+              vertexColors
+              transparent
+              opacity={0.95}
+              depthWrite={false}
+            />
+          </lineSegments>
+        );
+      })}
+    </>
+  );
+}
+
+
+================================================
 FILE: src/core/setupBVH.ts
 ================================================
 // src/core/setupBVH.ts
@@ -761,120 +1671,6 @@ export const BVH_READY = true;
 ================================================
 FILE: src/core/Terrain.tsx
 ================================================
-// // src/core/Terrain.tsx
-// import { useEffect, useState, useRef } from "react";
-// import { invoke } from "@tauri-apps/api/core";
-// import * as THREE from "three";
-// import { useDem } from "./DemContext";
-// import { makeBounds, type DemData } from "./dem";
-
-// interface Props {
-//   stride: number;
-//   onPointerMove?: (world: THREE.Vector3) => void;
-//   onPointerOut?: () => void;
-//   onClick?: (world: THREE.Vector3) => void;
-//   onRightClick?: (world: THREE.Vector3) => void;
-// }
-
-// export function Terrain({ stride, onPointerMove, onPointerOut, onClick, onRightClick }: Props) {
-//   const { setDem } = useDem();
-//   const [geom, setGeom] = useState<THREE.BufferGeometry | null>(null);
-//   const downScreen = useRef<{ x: number; y: number } | null>(null);
-
-//   useEffect(() => {
-//     let alive = true;
-//     const t0 = performance.now();
-//     console.log(`[dem] loading stride=${stride}`);
-
-//     invoke<ArrayBuffer>("load_dem_mesh", { stride })
-//       .then((buf) => {
-//         if (!alive) return;
-//         const view = new DataView(buf);
-//         const width  = view.getUint32(0, true);
-//         const height = view.getUint32(4, true);
-//         const west   = view.getFloat64(8, true);
-//         const south  = view.getFloat64(16, true);
-//         const east   = view.getFloat64(24, true);
-//         const north  = view.getFloat64(32, true);
-//         const heights = new Float32Array(buf, 40, width * height);
-
-//         const bounds = makeBounds(west, south, east, north);
-
-//         const positions = new Float32Array(width * height * 3);
-//         for (let j = 0; j < height; j++) {
-//           for (let i = 0; i < width; i++) {
-//             const idx = (j * width + i) * 3;
-//             positions[idx]     = (i / (width - 1) - 0.5) * bounds.widthM;
-//             positions[idx + 1] = heights[j * width + i];
-//             positions[idx + 2] = (0.5 - j / (height - 1)) * bounds.depthM;
-//           }
-//         }
-
-//         const indices = new Uint32Array((width - 1) * (height - 1) * 6);
-//         let k = 0;
-//         for (let j = 0; j < height - 1; j++) {
-//           for (let i = 0; i < width - 1; i++) {
-//             const a = j * width + i;
-//             const b = a + 1;
-//             const c = a + width;
-//             const d = c + 1;
-//             indices[k++] = a; indices[k++] = c; indices[k++] = b;
-//             indices[k++] = b; indices[k++] = c; indices[k++] = d;
-//           }
-//         }
-
-//         const g = new THREE.BufferGeometry();
-//         g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-//         g.setIndex(new THREE.BufferAttribute(indices, 1));
-//         g.computeVertexNormals();
-//         g.computeBoundingSphere();
-//         (g as any).computeBoundsTree();   // ← BVH acceleration
-
-//         const data: DemData = { bounds, width, height, heights };
-//         setDem(data);
-//         setGeom(g);
-//         console.log(
-//           `[dem] ${width}×${height} loaded in ${(performance.now() - t0).toFixed(0)} ms`
-//         );
-//       })
-//       .catch((e) => console.error("[dem] failed:", e));
-
-//     return () => { alive = false; };
-//   }, [stride, setDem]);
-
-//   useEffect(() => () => { geom?.dispose(); }, [geom]);
-
-//   if (!geom) return null;
-
-//   return (
-//     <mesh
-//       geometry={geom}
-//       onPointerDown={(e) => {
-//         e.stopPropagation();
-//         downScreen.current = { x: e.clientX ?? 0, y: e.clientY ?? 0 };
-//       }}
-//       onPointerMove={(e) => { e.stopPropagation(); if (onPointerMove && e.point) onPointerMove(e.point.clone()); }}
-//       onPointerOut={() => onPointerOut?.()}
-//       onPointerUp={(e) => {
-//         e.stopPropagation();
-//         const d = downScreen.current;
-//         downScreen.current = null;
-//         if (!d) return;
-//         const dist = Math.hypot((e.clientX ?? 0) - d.x, (e.clientY ?? 0) - d.y);
-//         if (dist > 5) return;   // dragged → not a click
-//         if (onClick && e.point) onClick(e.point.clone());
-//       }}
-//       onContextMenu={(e) => {
-//         e.stopPropagation();
-//         if (onRightClick && e.point) onRightClick(e.point.clone());
-//       }}
-//     >
-//       <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />
-//     </mesh>
-//   );
-// }
-
-
 // src/core/Terrain.tsx
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -911,6 +1707,7 @@ export function Terrain({
         const url = URL.createObjectURL(blob);
         const loader = new THREE.TextureLoader();
         loader.load(url, (tex) => {
+          tex.flipY = false; 
           tex.colorSpace = THREE.SRGBColorSpace;
           tex.anisotropy = 8;
           tex.wrapS = THREE.ClampToEdgeWrapping;
@@ -948,14 +1745,14 @@ export function Terrain({
 
         // Positions
         const positions = new Float32Array(width * height * 3);
-        for (let j = 0; j < height; j++) {
-          for (let i = 0; i < width; i++) {
-            const idx = (j * width + i) * 3;
-            positions[idx]     = (i / (width - 1) - 0.5) * bounds.widthM;
-            positions[idx + 1] = heights[j * width + i];
-            positions[idx + 2] = (0.5 - j / (height - 1)) * bounds.depthM;
+          for (let j = 0; j < height; j++) {
+            for (let i = 0; i < width; i++) {
+              const idx = (j * width + i) * 3;
+              positions[idx]     = (i / (width - 1) - 0.5) * bounds.widthM;
+              positions[idx + 1] = heights[j * width + i];
+              positions[idx + 2] = (j / (height - 1) - 0.5) * bounds.depthM;
+            }
           }
-        }
 
         // UVs — matches the DEM bounds the texture was projected to.
         // u: 0 = west, 1 = east
@@ -1069,7 +1866,14 @@ import * as THREE from "three";
 import { Terrain } from "../../core/Terrain";
 import { useDem } from "../../core/DemContext";
 import { sampleElevation, snapToGrid, worldToLonLat } from "../../core/dem";
-import { CameraHUD, CameraReporter } from "../../core/CameraHUD";
+import { CameraHUD, CameraReporter, CompassRose } from "../../core/CameraHUD";
+import { OsmOverlay } from "../../core/OsmOverlay";
+import { GridRings } from "../../core/GridRings";
+import { CursorHUD } from "../../core/CursorHUD";
+import { cursorStore } from "../../core/hudStores";
+import { LocationLabels } from "../../core/LocationLabels";
+import { NorthArrow } from "../../core/NorthArrow";
+
 
 import { BUILDINGS, findBuilding } from "./buildings";
 import { Ghost } from "./Ghost";   // <-- NEW import
@@ -1089,6 +1893,16 @@ export interface PlacedBuilding {
   rotationY: number;
 }
 
+function slopeDegAt(dem: import("../../core/dem").DemData, x: number, z: number, step = 30) {
+  const hL = sampleElevation(dem, x - step, z);
+  const hR = sampleElevation(dem, x + step, z);
+  const hD = sampleElevation(dem, x, z - step);
+  const hU = sampleElevation(dem, x, z + step);
+  const dzdx = (hR - hL) / (2 * step);
+  const dzdz = (hU - hD) / (2 * step);
+  return THREE.MathUtils.radToDeg(Math.atan(Math.hypot(dzdx, dzdz)));
+}
+
 export function Community() {
   const { dem } = useDem();
   const [stride, setStride] = useState(8);
@@ -1096,6 +1910,13 @@ export function Community() {
   const [placed, setPlaced] = useState<PlacedBuilding[]>([]);
   const [cash, setCash] = useState(10_000);
   const [status, setStatus] = useState<string>("");
+
+  const [showRoads, setShowRoads] = useState(true);
+  const [showWater, setShowWater] = useState(true);
+  const [showRail,  setShowRail]  = useState(false);
+  const [showRings, setShowRings] = useState(true);
+  const [showLabels, setShowLabels] = useState(true);
+  const [showNorth,  setShowNorth]  = useState(true);
 
   // ghost position ref replaces old ghost state
   const ghostPos = useRef<{ x: number; y: number; z: number; active: boolean }>({
@@ -1138,17 +1959,37 @@ export function Community() {
   };
 
   const handlePointerMove = (world: THREE.Vector3) => {
-    if (!dem || !selected) { ghostPos.current.active = false; return; }
-    const x = snapToGrid(world.x, GRID_SIZE);
-    const z = snapToGrid(world.z, GRID_SIZE);
-    const y = sampleElevation(dem, x, z);
-    ghostPos.current.x = x;
-    ghostPos.current.y = y;
-    ghostPos.current.z = z;
-    ghostPos.current.active = true;
+    if (!dem) return;
+
+    const snappedX = snapToGrid(world.x, GRID_SIZE);
+    const snappedZ = snapToGrid(world.z, GRID_SIZE);
+    const y = sampleElevation(dem, snappedX, snappedZ);
+    const { lon, lat } = worldToLonLat(dem.bounds, world.x, world.z);
+
+    cursorStore.set({
+      active: true,
+      x: world.x,
+      z: world.z,
+      elevation: y,
+      lon,
+      lat,
+      slopeDeg: slopeDegAt(dem, world.x, world.z),
+    });
+
+    if (selected) {
+      ghostPos.current.x = snappedX;
+      ghostPos.current.y = y;
+      ghostPos.current.z = snappedZ;
+      ghostPos.current.active = true;
+    } else {
+      ghostPos.current.active = false;
+    }
   };
 
-  const handlePointerOut = () => { ghostPos.current.active = false; };
+  const handlePointerOut = () => {
+    ghostPos.current.active = false;
+    cursorStore.set({ ...cursorStore.value, active: false });
+  };
 
   const handleClick = (world: THREE.Vector3) => {
     if (!dem || !selected) return;
@@ -1267,6 +2108,47 @@ export function Community() {
           </select>
         </div>
 
+        <hr style={{ margin: "10px 0" }} />
+          <div style={{ fontSize: 12, marginBottom: 4 }}>Overlays:</div>
+          <label style={cbRowStyle}>
+            <input type="checkbox" checked={showRoads} onChange={(e) => setShowRoads(e.target.checked)} />
+            Roads
+          </label>
+          <label style={cbRowStyle}>
+            <input type="checkbox" checked={showWater} onChange={(e) => setShowWater(e.target.checked)} />
+            Rivers
+          </label>
+          <label style={cbRowStyle}>
+            <input type="checkbox" checked={showRail} onChange={(e) => setShowRail(e.target.checked)} />
+            Railways
+          </label>
+
+        <label style={cbRowStyle}>
+          <input
+            type="checkbox"
+            checked={showRings}
+            onChange={(e) => setShowRings(e.target.checked)}
+          />
+          Distance rings
+        </label>
+
+        <label style={cbRowStyle}>
+        <input
+          type="checkbox"
+          checked={showLabels}
+          onChange={(e) => setShowLabels(e.target.checked)}
+        />
+        Place labels
+      </label>
+      <label style={cbRowStyle}>
+        <input
+          type="checkbox"
+          checked={showNorth}
+          onChange={(e) => setShowNorth(e.target.checked)}
+        />
+        North arrow
+      </label>
+
         {status && (
           <div style={{ marginTop: 8, fontSize: 11, color: "#333" }}>{status}</div>
         )}
@@ -1278,6 +2160,8 @@ export function Community() {
           dem ? sampleElevation(dem, 0, 0) : null   // valley-center reference
         }
       />
+      <CursorHUD />
+      <CompassRose />
 
       {/* ---- 3D scene ---- */}
       <Canvas
@@ -1297,18 +2181,10 @@ export function Community() {
           onClick={handleClick}
           onRightClick={handleRightClick}
         />
-
-        {/* Placed buildings */}
-        {placed.map((p) => {
-          const def = findBuilding(p.typeId);
-          if (!def) return null;
-          return (
-            <mesh key={p.id} position={[p.worldX, p.elevation + def.sizeY / 2, p.worldZ]} rotation={[0, p.rotationY, 0]}>
-              <boxGeometry args={[def.sizeX, def.sizeY, def.sizeZ]} />
-              <meshStandardMaterial color={def.color} />
-            </mesh>
-          );
-        })}
+        <GridRings visible={showRings} />
+        <OsmOverlay visible={{ roads: showRoads, water: showWater, rail: showRail }} />
+        <LocationLabels visible={showLabels} />
+        <NorthArrow visible={showNorth} />
 
         {/* Placed buildings */}
         <PlacedBuildings placed={placed} />
@@ -1317,6 +2193,7 @@ export function Community() {
         <Ghost posRef={ghostPos} typeId={selected} rotationY={previewRotation} />
 
         <OrbitControls
+          makeDefault
           target={[0, 800, 0]}
           maxPolarAngle={Math.PI / 2.15}
           minDistance={100}
@@ -1338,6 +2215,11 @@ const hudStyle: React.CSSProperties = {
 const btnStyle: React.CSSProperties = {
   display: "block", width: "100%", marginBottom: 4,
   padding: "4px 8px", fontSize: 12, cursor: "pointer",
+};
+
+const cbRowStyle: React.CSSProperties = {
+  display: "flex", alignItems: "center", gap: 6,
+  fontSize: 12, padding: "2px 0", cursor: "pointer",
 };
 
 
@@ -1499,7 +2381,9 @@ FILE: src-tauri/tauri.conf.json
     "active": true,
     "resources": [
         "resources/dem/imphal_full.tif",
-        "resources/dem/imphal_texture.jpg"
+        "resources/dem/imphal_texture.jpg",
+        "resources/osm/imphal_osm.geojson",
+        "resources/osm/imphal_osm.meta.json"
       ],
     "targets": "all",
     "icon": [
@@ -1539,7 +2423,8 @@ FILE: src-tauri/icons/icon.icns
 ================================================
 FILE: src-tauri/src/lib.rs
 ================================================
-mod terrain;
+mod osm;
+mod terrain; // <-- ADD
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -1557,6 +2442,7 @@ pub fn run() {
             terrain::load_terrain_texture,
             terrain::save_city,
             terrain::load_city,
+            osm::load_osm_geojson,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1572,6 +2458,28 @@ FILE: src-tauri/src/main.rs
 
 fn main() {
     buildit_studio_lib::run()
+}
+
+
+
+================================================
+FILE: src-tauri/src/osm.rs
+================================================
+use tauri::{AppHandle, Manager};
+
+#[tauri::command]
+pub async fn load_osm_geojson(app: AppHandle) -> Result<String, String> {
+    let path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir: {}", e))?
+        .join("resources")
+        .join("osm")
+        .join("imphal_osm.geojson");
+
+    let s = std::fs::read_to_string(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+    println!("[osm] loaded {} bytes from {:?}", s.len(), path);
+    Ok(s)
 }
 
 
