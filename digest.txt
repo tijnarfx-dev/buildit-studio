@@ -2,9 +2,9 @@ Directory structure:
 └── buildit-studio/
     ├── README.md
     ├── index.html
-    ├── inspect_tile.py
     ├── package.json
     ├── postcss.config.mjs
+    ├── sentinel_prep.py
     ├── tsconfig.json
     ├── tsconfig.node.json
     ├── vite.config.ts
@@ -14,14 +14,18 @@ Directory structure:
     │   ├── App.tsx
     │   ├── main.tsx
     │   ├── vite-env.d.ts
-    │   ├── components/
-    │   │   ├── Terrain.tsx
-    │   │   ├── TerrainScene.tsx
-    │   │   └── TerrainTile.tsx
-    │   └── lib/
-    │       ├── addSkirts.ts
-    │       ├── quantizedMesh.ts
-    │       └── tileMath.ts
+    │   ├── core/
+    │   │   ├── CameraHUD.tsx
+    │   │   ├── dem.ts
+    │   │   ├── DemContext.tsx
+    │   │   ├── setupBVH.ts
+    │   │   └── Terrain.tsx
+    │   └── editions/
+    │       └── community/
+    │           ├── buildings.ts
+    │           ├── Community.tsx
+    │           ├── Ghost.tsx
+    │           └── PlacedBuildings.tsx
     └── src-tauri/
         ├── build.rs
         ├── Cargo.toml
@@ -69,18 +73,6 @@ FILE: index.html
 
 
 ================================================
-FILE: inspect_tile.py
-================================================
-import gzip, sys
-p = r"src-tauri\resources\terrain\srtm_tiles\11\3120\1313.terrain"
-with gzip.open(p, "rb") as f:
-    data = f.read()
-print(f"length: {len(data)}")
-print(f"first 32 bytes (ascii): {data[:32]!r}")
-print(f"first 32 bytes (hex):   {data[:32].hex(' ')}")
-
-
-================================================
 FILE: package.json
 ================================================
 {
@@ -105,7 +97,8 @@ FILE: package.json
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "tailwindcss": "^4.3.3",
-    "three": "^0.186.0"
+    "three": "^0.186.0",
+    "three-mesh-bvh": "^0.9.15"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
@@ -127,6 +120,128 @@ export default {
     "@tailwindcss/postcss": {},
   }
 }
+
+
+================================================
+FILE: sentinel_prep.py
+================================================
+"""
+Preprocess Sentinel-2 L2A tiles into a single 4096² JPEG aligned with the DEM.
+"""
+import numpy as np
+import rasterio
+from rasterio.merge import merge
+from rasterio.warp import reproject, Resampling
+from rasterio.transform import from_bounds as transform_from_bounds
+from pathlib import Path
+from PIL import Image
+
+# ---- Configuration ----
+# SAFE_DIR    = Path(r"C:\Users\John\data\imphal_valley\copernicus\sentinel2")
+# DEM_PATH    = Path(r"D:\John\data\imphal_valley\copernicus\dem\imphal_merged_dem.tif")
+# OUT_PATH    = Path(r"src-tauri\resources\dem\imphal_texture.jpg")
+
+SAFE_DIR = Path("/mnt/c/users/john/data/imphal_valley/copernicus/sentinel2")
+DEM_PATH = Path("/mnt/c/users/john/data/imphal_valley/copernicus/dem/imphal_merged_dem.tif")
+OUT_PATH = Path("src-tauri/resources/dem/imphal_texture.jpg")
+TARGET_SIZE = 4096
+
+# ---- 1. DEM bounds (crop target) ----
+with rasterio.open(DEM_PATH) as dem:
+    dem_bounds = dem.bounds
+    print(f"DEM bounds: {dem_bounds}")
+    print(f"DEM CRS:    {dem.crs}")
+
+# ---- 2. Find band files ----
+def find_band(band):
+    return [
+        m for m in SAFE_DIR.glob(f"**/*_{band}_10m.jp2")
+        if "PREVIEW" not in m.name.upper()
+    ]
+
+reds   = find_band("B04")
+greens = find_band("B03")
+blues  = find_band("B02")
+scls   = [m for m in SAFE_DIR.glob("**/*_SCL_20m.jp2") if "PREVIEW" not in m.name.upper()]
+
+print(f"B04 tiles: {len(reds)}  B03: {len(greens)}  B02: {len(blues)}  SCL: {len(scls)}")
+if not (reds and greens and blues):
+    raise SystemExit("Missing bands.")
+
+# ---- 3. Mosaic ----
+def mosaic(paths):
+    srcs = [rasterio.open(p) for p in paths]
+    arr, transform = merge(srcs)
+    crs = srcs[0].crs
+    for s in srcs:
+        s.close()
+    return arr[0].astype(np.float32), transform, crs
+
+red,   src_transform, src_crs = mosaic(reds)
+green, _, _                   = mosaic(greens)
+blue,  _, _                   = mosaic(blues)
+scl,   _, _                   = mosaic(scls) if scls else (None, None, None)
+
+print(f"Mosaic: {red.shape}, CRS: {src_crs}")
+
+# ---- 4. Reproject to WGS84 at DEM bounds ----
+dst_crs = "EPSG:4326"
+dst_transform = transform_from_bounds(
+    dem_bounds.left, dem_bounds.bottom, dem_bounds.right, dem_bounds.top,
+    TARGET_SIZE, TARGET_SIZE,
+)
+
+def reproject_band(src_arr, resampling):
+    dst = np.zeros((TARGET_SIZE, TARGET_SIZE), dtype=np.float32)
+    reproject(
+        source=src_arr,
+        destination=dst,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        src_nodata=None,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        dst_nodata=0,
+        resampling=resampling,
+    )
+    return dst
+
+red_ll   = reproject_band(red,   Resampling.bilinear)
+green_ll = reproject_band(green, Resampling.bilinear)
+blue_ll  = reproject_band(blue,  Resampling.bilinear)
+
+if scl is not None:
+    scl_ll = reproject_band(scl, Resampling.nearest).astype(np.uint8)
+    cloud_mask = np.isin(scl_ll, [3, 8, 9, 10])
+    print(f"Cloud/shadow: {100*cloud_mask.mean():.1f}%")
+else:
+    cloud_mask = np.zeros_like(red_ll, dtype=bool)
+
+# ---- 5. Composite + contrast stretch ----
+rgb = np.stack([red_ll, green_ll, blue_ll], axis=-1)
+
+if cloud_mask.any():
+    for ch in range(3):
+        median = np.median(rgb[~cloud_mask, ch])
+        rgb[cloud_mask, ch] = median
+
+valid = ~cloud_mask
+for ch in range(3):
+    p2  = np.percentile(rgb[valid, ch], 2)
+    p98 = np.percentile(rgb[valid, ch], 98)
+    if p98 > p2:
+        rgb[..., ch] = np.clip((rgb[..., ch] - p2) / (p98 - p2), 0, 1)
+
+# Mild saturation boost
+gray = rgb.mean(axis=-1, keepdims=True)
+rgb = np.clip(gray + (rgb - gray) * 1.15, 0, 1)
+
+img = (rgb * 255).astype(np.uint8)
+
+# ---- 6. Save ----
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+Image.fromarray(img).save(OUT_PATH, quality=88, optimize=True)
+print(f"Wrote {OUT_PATH} ({OUT_PATH.stat().st_size / 1e6:.2f} MB)")
 
 
 ================================================
@@ -349,53 +464,16 @@ button {
 ================================================
 FILE: src/App.tsx
 ================================================
-import { useState } from "react";
-import { Canvas } from "@react-three/fiber";
-import { OrbitControls } from "@react-three/drei";
-import { Terrain } from "./components/Terrain";
-import * as THREE from "three";
+// src/App.tsx
+import { DemProvider } from "./core/DemContext";
+import { Community } from "./editions/community/Community";
 import "./App.css";
 
-const SKY_COLOR = "#b8d4e8";
-
 function App() {
-  const [stride, setStride] = useState(8);   // start conservative
-
   return (
-    <div style={{ width: "100vw", height: "100vh", position: "relative" }}>
-      <div style={{
-        position: "absolute", top: 12, left: 12, zIndex: 10,
-        background: "#fff", padding: 8, borderRadius: 6,
-        fontFamily: "monospace", fontSize: 13,
-      }}>
-        Stride:&nbsp;
-        <select value={stride} onChange={(e) => setStride(Number(e.target.value))}>
-          <option value={16}>16 (fastest, coarse)</option>
-          <option value={8}>8  (fast)</option>
-          <option value={4}>4  (balanced)</option>
-          <option value={2}>2  (detailed, may lag)</option>
-          <option value={1}>1  (full 30 m — heavy)</option>
-        </select>
-      </div>
-
-      <Canvas
-        camera={{ position: [0, 20_000, 25_000], fov: 45, near: 10, far: 120_000 }}
-        onCreated={({ scene }) => {
-          scene.background = new THREE.Color(SKY_COLOR);
-          scene.fog = new THREE.Fog(SKY_COLOR, 30_000, 90_000);
-        }}
-      >
-        <ambientLight intensity={0.7} />
-        <directionalLight position={[20_000, 30_000, 20_000]} intensity={1.2} />
-        <Terrain stride={stride} />
-        <OrbitControls
-          target={[0, 800, 0]}
-          maxPolarAngle={Math.PI / 2.15}
-          minDistance={500}
-          maxDistance={80_000}
-        />
-      </Canvas>
-    </div>
+    <DemProvider>
+      <Community />
+    </DemProvider>
   );
 }
 
@@ -408,11 +486,12 @@ FILE: src/main.tsx
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import "./core/setupBVH";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  // <React.StrictMode>
+  <React.StrictMode>
     <App />
-  // </React.StrictMode>,
+  </React.StrictMode>,
 );
 
 
@@ -425,52 +504,472 @@ FILE: src/vite-env.d.ts
 
 
 ================================================
-FILE: src/components/Terrain.tsx
+FILE: src/core/CameraHUD.tsx
 ================================================
+// src/core/CameraHUD.tsx
+import { useEffect, useRef, useState } from "react";
+import { useFrame, useThree } from "@react-three/fiber";
+
+// Tiny external store — one writer (R3F), one reader (React DOM).
+const store = {
+  value: 0,
+  listeners: new Set<(v: number) => void>(),
+  set(v: number) {
+    this.value = v;
+    this.listeners.forEach((fn) => fn(v));
+  },
+};
+
+/**
+ * Must be placed INSIDE <Canvas>. Samples camera Y each frame and pushes
+ * to the shared store at ~15 Hz (no per-frame React re-renders).
+ */
+export function CameraReporter() {
+  const { camera } = useThree();
+  const lastPush = useRef(0);
+
+  useFrame((_, delta) => {
+    lastPush.current += delta;
+    if (lastPush.current < 1 / 15) return;   // throttle to 15 Hz
+    lastPush.current = 0;
+    store.set(camera.position.y);
+  });
+
+  return null;
+}
+
+/**
+ * Renders outside the Canvas. Reads from the shared store.
+ */
+export function CameraHUD({
+  groundElevation,
+}: {
+  groundElevation: number | null;
+}) {
+  const [alt, setAlt] = useState(store.value);
+
+  useEffect(() => {
+    store.listeners.add(setAlt);
+    return () => {
+      store.listeners.delete(setAlt);
+    };
+  }, []);
+
+  const altAboveGround =
+    groundElevation != null ? Math.max(0, alt - groundElevation) : null;
+
+  // Format helpers
+  const fmt = (m: number) =>
+    Math.abs(m) >= 1000
+      ? `${(m / 1000).toFixed(2)} km`
+      : `${m.toFixed(0)} m`;
+
+  return (
+    <div style={hudBoxStyle}>
+      <div style={hudRowStyle}>
+        <span style={hudLabelStyle}>Altitude</span>
+        <span style={hudValueStyle}>{fmt(alt)}</span>
+      </div>
+      {altAboveGround != null && (
+        <div style={hudRowStyle}>
+          <span style={hudLabelStyle}>Above ground</span>
+          <span style={hudValueStyle}>{fmt(altAboveGround)}</span>
+        </div>
+      )}
+      <div style={hudRowStyle}>
+        <span style={hudLabelStyle}>Scale ref</span>
+        <span style={{ ...hudValueStyle, fontSize: 11, color: "#666" }}>
+          1 km ≈ {Math.round(1000 / Math.max(1, alt / 100))} screen units
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ---- styles ----
+const hudBoxStyle: React.CSSProperties = {
+  position: "absolute",
+  bottom: 16,
+  left: 16,
+  zIndex: 10,
+  background: "rgba(255, 255, 255, 0.92)",
+  padding: "8px 12px",
+  borderRadius: 6,
+  fontFamily: "system-ui, sans-serif",
+  fontSize: 12,
+  boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+  minWidth: 170,
+  backdropFilter: "blur(4px)",
+};
+
+const hudRowStyle: React.CSSProperties = {
+  display: "flex",
+  justifyContent: "space-between",
+  alignItems: "center",
+  gap: 12,
+  padding: "2px 0",
+};
+
+const hudLabelStyle: React.CSSProperties = {
+  color: "#666",
+};
+
+const hudValueStyle: React.CSSProperties = {
+  fontWeight: 600,
+  color: "#111",
+  fontVariantNumeric: "tabular-nums",
+};
+
+
+================================================
+FILE: src/core/dem.ts
+================================================
+// src/core/dem.ts
+// Coordinate system: world origin at DEM center.
+//   +X = east (meters)
+//   +Y = elevation (meters, absolute)
+//   +Z = north (meters)   [note: this matches the Terrain mesh orientation]
+
+export const METERS_PER_DEG_LAT = 110_540;
+export const metersPerDegLon = (lat: number) =>
+  111_320 * Math.cos((lat * Math.PI) / 180);
+
+export interface DemBounds {
+  west: number;
+  south: number;
+  east: number;
+  north: number;
+  centerLon: number;
+  centerLat: number;
+  widthM: number;
+  depthM: number;
+}
+
+export interface DemData {
+  bounds: DemBounds;
+  width: number;
+  height: number;
+  heights: Float32Array; // row-major, north → south
+}
+
+export function makeBounds(
+  west: number, south: number, east: number, north: number
+): DemBounds {
+  const centerLon = (west + east) / 2;
+  const centerLat = (south + north) / 2;
+  const mLon = metersPerDegLon(centerLat);
+  return {
+    west, south, east, north,
+    centerLon, centerLat,
+    widthM: (east - west) * mLon,
+    depthM: (north - south) * METERS_PER_DEG_LAT,
+  };
+}
+
+export function worldToLonLat(b: DemBounds, x: number, z: number) {
+  const mLon = metersPerDegLon(b.centerLat);
+  return {
+    lon: b.centerLon + x / mLon,
+    lat: b.centerLat + z / METERS_PER_DEG_LAT,
+  };
+}
+
+export function lonLatToWorld(b: DemBounds, lon: number, lat: number) {
+  const mLon = metersPerDegLon(b.centerLat);
+  return {
+    x: (lon - b.centerLon) * mLon,
+    z: (lat - b.centerLat) * METERS_PER_DEG_LAT,
+  };
+}
+
+/** Sample DEM elevation at world (x,z) using bilinear interpolation. */
+export function sampleElevation(dem: DemData, x: number, z: number): number {
+  const { bounds, width, height, heights } = dem;
+  const u = (x / bounds.widthM) + 0.5;   // [0,1] from west to east
+  const v = 0.5 - (z / bounds.depthM);   // [0,1] from north to south
+
+  const fx = Math.min(Math.max(u, 0), 1) * (width - 1);
+  const fy = Math.min(Math.max(v, 0), 1) * (height - 1);
+
+  const x0 = Math.floor(fx), x1 = Math.min(x0 + 1, width - 1);
+  const y0 = Math.floor(fy), y1 = Math.min(y0 + 1, height - 1);
+  const tx = fx - x0, ty = fy - y0;
+
+  const h00 = heights[y0 * width + x0];
+  const h10 = heights[y0 * width + x1];
+  const h01 = heights[y1 * width + x0];
+  const h11 = heights[y1 * width + x1];
+
+  return (
+    h00 * (1 - tx) * (1 - ty) +
+    h10 * tx * (1 - ty) +
+    h01 * (1 - tx) * ty +
+    h11 * tx * ty
+  );
+}
+
+/** Snap a world coordinate to a metric grid of `size` meters. */
+export const snapToGrid = (v: number, size: number) =>
+  Math.round(v / size) * size;
+
+
+================================================
+FILE: src/core/DemContext.tsx
+================================================
+// src/core/DemContext.tsx
+import { createContext, useContext, useState, type ReactNode } from "react";
+import type { DemData } from "./dem";
+
+interface Ctx {
+  dem: DemData | null;
+  setDem: (d: DemData | null) => void;
+}
+
+const DemContext = createContext<Ctx>({ dem: null, setDem: () => {} });
+
+export function DemProvider({ children }: { children: ReactNode }) {
+  const [dem, setDem] = useState<DemData | null>(null);
+  return (
+    <DemContext.Provider value={{ dem, setDem }}>
+      {children}
+    </DemContext.Provider>
+  );
+}
+
+export const useDem = () => useContext(DemContext);
+
+
+================================================
+FILE: src/core/setupBVH.ts
+================================================
+// src/core/setupBVH.ts
+import * as THREE from "three";
+import {
+  computeBoundsTree,
+  disposeBoundsTree,
+  acceleratedRaycast,
+} from "three-mesh-bvh";
+
+// Monkey-patch BufferGeometry + Mesh once, globally
+(THREE.BufferGeometry.prototype as any).computeBoundsTree = computeBoundsTree;
+(THREE.BufferGeometry.prototype as any).disposeBoundsTree = disposeBoundsTree;
+(THREE.Mesh.prototype as any).raycast = acceleratedRaycast;
+
+export const BVH_READY = true;
+
+
+================================================
+FILE: src/core/Terrain.tsx
+================================================
+// // src/core/Terrain.tsx
+// import { useEffect, useState, useRef } from "react";
+// import { invoke } from "@tauri-apps/api/core";
+// import * as THREE from "three";
+// import { useDem } from "./DemContext";
+// import { makeBounds, type DemData } from "./dem";
+
+// interface Props {
+//   stride: number;
+//   onPointerMove?: (world: THREE.Vector3) => void;
+//   onPointerOut?: () => void;
+//   onClick?: (world: THREE.Vector3) => void;
+//   onRightClick?: (world: THREE.Vector3) => void;
+// }
+
+// export function Terrain({ stride, onPointerMove, onPointerOut, onClick, onRightClick }: Props) {
+//   const { setDem } = useDem();
+//   const [geom, setGeom] = useState<THREE.BufferGeometry | null>(null);
+//   const downScreen = useRef<{ x: number; y: number } | null>(null);
+
+//   useEffect(() => {
+//     let alive = true;
+//     const t0 = performance.now();
+//     console.log(`[dem] loading stride=${stride}`);
+
+//     invoke<ArrayBuffer>("load_dem_mesh", { stride })
+//       .then((buf) => {
+//         if (!alive) return;
+//         const view = new DataView(buf);
+//         const width  = view.getUint32(0, true);
+//         const height = view.getUint32(4, true);
+//         const west   = view.getFloat64(8, true);
+//         const south  = view.getFloat64(16, true);
+//         const east   = view.getFloat64(24, true);
+//         const north  = view.getFloat64(32, true);
+//         const heights = new Float32Array(buf, 40, width * height);
+
+//         const bounds = makeBounds(west, south, east, north);
+
+//         const positions = new Float32Array(width * height * 3);
+//         for (let j = 0; j < height; j++) {
+//           for (let i = 0; i < width; i++) {
+//             const idx = (j * width + i) * 3;
+//             positions[idx]     = (i / (width - 1) - 0.5) * bounds.widthM;
+//             positions[idx + 1] = heights[j * width + i];
+//             positions[idx + 2] = (0.5 - j / (height - 1)) * bounds.depthM;
+//           }
+//         }
+
+//         const indices = new Uint32Array((width - 1) * (height - 1) * 6);
+//         let k = 0;
+//         for (let j = 0; j < height - 1; j++) {
+//           for (let i = 0; i < width - 1; i++) {
+//             const a = j * width + i;
+//             const b = a + 1;
+//             const c = a + width;
+//             const d = c + 1;
+//             indices[k++] = a; indices[k++] = c; indices[k++] = b;
+//             indices[k++] = b; indices[k++] = c; indices[k++] = d;
+//           }
+//         }
+
+//         const g = new THREE.BufferGeometry();
+//         g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+//         g.setIndex(new THREE.BufferAttribute(indices, 1));
+//         g.computeVertexNormals();
+//         g.computeBoundingSphere();
+//         (g as any).computeBoundsTree();   // ← BVH acceleration
+
+//         const data: DemData = { bounds, width, height, heights };
+//         setDem(data);
+//         setGeom(g);
+//         console.log(
+//           `[dem] ${width}×${height} loaded in ${(performance.now() - t0).toFixed(0)} ms`
+//         );
+//       })
+//       .catch((e) => console.error("[dem] failed:", e));
+
+//     return () => { alive = false; };
+//   }, [stride, setDem]);
+
+//   useEffect(() => () => { geom?.dispose(); }, [geom]);
+
+//   if (!geom) return null;
+
+//   return (
+//     <mesh
+//       geometry={geom}
+//       onPointerDown={(e) => {
+//         e.stopPropagation();
+//         downScreen.current = { x: e.clientX ?? 0, y: e.clientY ?? 0 };
+//       }}
+//       onPointerMove={(e) => { e.stopPropagation(); if (onPointerMove && e.point) onPointerMove(e.point.clone()); }}
+//       onPointerOut={() => onPointerOut?.()}
+//       onPointerUp={(e) => {
+//         e.stopPropagation();
+//         const d = downScreen.current;
+//         downScreen.current = null;
+//         if (!d) return;
+//         const dist = Math.hypot((e.clientX ?? 0) - d.x, (e.clientY ?? 0) - d.y);
+//         if (dist > 5) return;   // dragged → not a click
+//         if (onClick && e.point) onClick(e.point.clone());
+//       }}
+//       onContextMenu={(e) => {
+//         e.stopPropagation();
+//         if (onRightClick && e.point) onRightClick(e.point.clone());
+//       }}
+//     >
+//       <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />
+//     </mesh>
+//   );
+// }
+
+
+// src/core/Terrain.tsx
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as THREE from "three";
+import { useDem } from "./DemContext";
+import { makeBounds, type DemData } from "./dem";
 
-const METERS_PER_DEG_LAT = 110_540;
-const metersPerDegLon = (lat: number) => 111_320 * Math.cos((lat * Math.PI) / 180);
+interface Props {
+  stride: number;
+  onPointerMove?: (world: THREE.Vector3) => void;
+  onPointerOut?: () => void;
+  onClick?: (world: THREE.Vector3) => void;
+  onRightClick?: (world: THREE.Vector3) => void;
+}
 
-export function Terrain({ stride }: { stride: number }) {
-  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
-  const [stats, setStats] = useState<string>("");
+export function Terrain({
+  stride,
+  onPointerMove,
+  onPointerOut,
+  onClick,
+  onRightClick,
+}: Props) {
+  const { setDem } = useDem();
+  const [geom, setGeom] = useState<THREE.BufferGeometry | null>(null);
+  const [texture, setTexture] = useState<THREE.Texture | null>(null);
 
+  // ---- Load texture once ----
+  useEffect(() => {
+    let alive = true;
+    invoke<ArrayBuffer>("load_terrain_texture")
+      .then((buf) => {
+        if (!alive) return;
+        const blob = new Blob([buf], { type: "image/jpeg" });
+        const url = URL.createObjectURL(blob);
+        const loader = new THREE.TextureLoader();
+        loader.load(url, (tex) => {
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.anisotropy = 8;
+          tex.wrapS = THREE.ClampToEdgeWrapping;
+          tex.wrapT = THREE.ClampToEdgeWrapping;
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          setTexture(tex);
+          URL.revokeObjectURL(url);
+          console.log("[dem] texture loaded and applied");
+        });
+      })
+      .catch((e) => console.error("[dem] texture failed:", e));
+    return () => { alive = false; };
+  }, []);
+
+  // ---- Load DEM mesh ----
   useEffect(() => {
     let alive = true;
     const t0 = performance.now();
     console.log(`[dem] loading stride=${stride}`);
+
     invoke<ArrayBuffer>("load_dem_mesh", { stride })
       .then((buf) => {
         if (!alive) return;
         const view = new DataView(buf);
-        const width  = view.getUint32(0, true);    // bytes 0-3
-        const height = view.getUint32(4, true);    // bytes 4-7
-        const west   = view.getFloat64(8, true);   // bytes 8-15
-        const south  = view.getFloat64(16, true);  // bytes 16-23
-        const east   = view.getFloat64(24, true);  // bytes 24-31
-        const north  = view.getFloat64(32, true);  // bytes 32-39
-        const heights = new Float32Array(buf, 40, width * height);  // ← 40, not 32
+        const width  = view.getUint32(0, true);
+        const height = view.getUint32(4, true);
+        const west   = view.getFloat64(8, true);
+        const south  = view.getFloat64(16, true);
+        const east   = view.getFloat64(24, true);
+        const north  = view.getFloat64(32, true);
+        const heights = new Float32Array(buf, 40, width * height);
 
-        const midLat = (south + north) / 2;
-        const widthM = (east - west) * metersPerDegLon(midLat);
-        const depthM = (north - south) * METERS_PER_DEG_LAT;
+        const bounds = makeBounds(west, south, east, north);
 
+        // Positions
         const positions = new Float32Array(width * height * 3);
-        let minH = Infinity, maxH = -Infinity;
         for (let j = 0; j < height; j++) {
           for (let i = 0; i < width; i++) {
             const idx = (j * width + i) * 3;
-            positions[idx]     = (i / (width - 1) - 0.5) * widthM;
+            positions[idx]     = (i / (width - 1) - 0.5) * bounds.widthM;
             positions[idx + 1] = heights[j * width + i];
-            positions[idx + 2] = (0.5 - j / (height - 1)) * depthM;
-            if (positions[idx + 1] < minH) minH = positions[idx + 1];
-            if (positions[idx + 1] > maxH) maxH = positions[idx + 1];
+            positions[idx + 2] = (0.5 - j / (height - 1)) * bounds.depthM;
           }
         }
 
+        // UVs — matches the DEM bounds the texture was projected to.
+        // u: 0 = west, 1 = east
+        // v: 0 = north, 1 = south  (with texture flipY=true, default)
+        const uvs = new Float32Array(width * height * 2);
+        for (let j = 0; j < height; j++) {
+          for (let i = 0; i < width; i++) {
+            const idx = (j * width + i) * 2;
+            uvs[idx]     = i / (width - 1);
+            uvs[idx + 1] = j / (height - 1);
+          }
+        }
+
+        // Indices
         const indices = new Uint32Array((width - 1) * (height - 1) * 6);
         let k = 0;
         for (let j = 0; j < height - 1; j++) {
@@ -486,447 +985,439 @@ export function Terrain({ stride }: { stride: number }) {
 
         const g = new THREE.BufferGeometry();
         g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        g.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
         g.setIndex(new THREE.BufferAttribute(indices, 1));
         g.computeVertexNormals();
         g.computeBoundingSphere();
-        setGeometry(g);
+        (g as any).computeBoundsTree?.();
 
-        const ms = (performance.now() - t0).toFixed(0);
-        const info = `${width}×${height} = ${(width * height / 1e6).toFixed(2)}M verts, ` +
-                     `elev ${minH.toFixed(0)}–${maxH.toFixed(0)} m, ${ms} ms`;
-        console.log(`[dem] ${info}`);
-        setStats(info);
+        const data: DemData = { bounds, width, height, heights };
+        setDem(data);
+        setGeom(g);
+        console.log(
+          `[dem] ${width}×${height} loaded in ${(performance.now() - t0).toFixed(0)} ms`
+        );
       })
       .catch((e) => console.error("[dem] failed:", e));
+
     return () => { alive = false; };
-  }, [stride]);
+  }, [stride, setDem]);
 
-  useEffect(() => () => { geometry?.dispose(); }, [geometry]);
+  useEffect(() => () => { geom?.dispose(); }, [geom]);
 
-  if (!geometry) return null;
+  if (!geom) return null;
 
-  return (
-    <>
-      <mesh geometry={geometry}>
-        <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />
-      </mesh>
-      {/* Debug text via DOM — handled in App, this is just for context */}
-    </>
-  );
-}
-
-
-================================================
-FILE: src/components/TerrainScene.tsx
-================================================
-// src/components/TerrainScene.tsx
-import { useEffect, useMemo, useRef, useState } from "react";
-import { useThree } from "@react-three/fiber";
-import { invoke } from "@tauri-apps/api/core";
-import { TerrainTile } from "./TerrainTile";
-import { tileWorldBounds } from "../lib/tileMath";
-
-interface TileCoord { z: number; x: number; y: number; }
-
-const CULL_RADIUS_M = 80_000;       // was 20_000 — covers the full 1° DEM
-const MOVE_THRESHOLD_M = 2_000;     // was 1_000
-const POLL_INTERVAL_MS = 300;
-
-export function TerrainScene({ zoom }: { zoom: number }) {
-  const [all, setAll] = useState<TileCoord[]>([]);
-  const [cameraXZ, setCameraXZ] = useState<[number, number]>([0, 0]);
-  const { camera } = useThree();
-  const last = useRef<[number, number]>([Infinity, Infinity]);
-
-  // Load tile index once
-  useEffect(() => {
-    invoke<TileCoord[]>("list_tiles")
-      .then((tiles) => {
-        console.log(`Loaded ${tiles.length} tile coords`);
-        setAll(tiles);
-      })
-      .catch((e) => console.error("list_tiles failed:", e));
-  }, []);
-
-  // Poll camera position; only trigger re-cull when it moves enough
-  useEffect(() => {
-    const id = setInterval(() => {
-      const { x, z } = camera.position;
-      const [lx, lz] = last.current;
-      if (Math.hypot(x - lx, z - lz) > MOVE_THRESHOLD_M) {
-        last.current = [x, z];
-        setCameraXZ([x, z]);
-      }
-    }, POLL_INTERVAL_MS);
-    return () => clearInterval(id);
-  }, [camera]);
-
-  // Filter to visible tiles
-  const visible = useMemo(() => {
-    const [cx, cz] = cameraXZ;
-    const r2 = CULL_RADIUS_M * CULL_RADIUS_M;
-    return all.filter((t) => {
-      if (t.z !== zoom) return false;
-      const w = tileWorldBounds(t.z, t.x, t.y);
-      const dx = w.centerX - cx;
-      const dz = w.centerZ - cz;
-      const halfDiag = Math.hypot(w.sizeX, w.sizeZ) * 0.5;
-      const edge = Math.max(0, Math.hypot(dx, dz) - halfDiag);
-      return edge * edge <= r2;
-    });
-  }, [all, zoom, cameraXZ]);
-
-  useEffect(() => {
-  console.log(`[cull] zoom ${zoom}: ${visible.length} tiles visible`);
-}, [visible.length, zoom]);
+  // Fallback until texture loads
+  const material = texture
+    ? <meshStandardMaterial map={texture} side={THREE.DoubleSide} roughness={0.95} metalness={0} />
+    : <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />;
 
   return (
-    <group>
-      {visible.map((t) => (
-        <TerrainTile key={`${t.z}/${t.x}/${t.y}`} z={t.z} x={t.x} y={t.y} />
-      ))}
-    </group>
-  );
-}
-
-
-================================================
-FILE: src/components/TerrainTile.tsx
-================================================
-// src/components/TerrainTile.tsx
-import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import * as THREE from "three";
-import { tileWorldBounds } from "../lib/tileMath";
-import { addSkirts } from "../lib/addSkirts";
-
-
-interface Props { z: number; x: number; y: number; }
-
-export function TerrainTile({ z, x, y }: Props) {
-  const [geometry, setGeometry] = useState<THREE.BufferGeometry | null>(null);
-
-  // Add near the top of the file:
-  const TILE_OVERLAP = 0.02; // 1% extra, i.e. ~25 m at zoom 12
-
-  useEffect(() => {
-    let alive = true;
-    invoke<ArrayBuffer>("get_terrain_tile_mesh", { zoom: z, x, y })
-      .then((buf) => {
-        if (!alive) return;
-        const view = new DataView(buf);
-        const vcount = view.getUint32(0, true);
-        const icount = view.getUint32(4, true);
-
-        if (vcount < 3 || icount < 3) {
-          // Empty or degenerate tile — nothing to render
-          return;
-        }
-
-        const rawPos = new Float32Array(buf, 8, vcount * 3);
-        const rawIdx = new Uint32Array(buf, 8 + vcount * 12, icount);
-        
-        // Skirt depth: 150 m is plenty — bigger than any plausible crack,
-        // small enough not to poke through neighbouring valleys.
-        // const { positions, indices } = addSkirts(rawPos.slice(), rawIdx.slice(), 150);
-        const { positions, indices } = addSkirts(rawPos.slice(), rawIdx.slice(), 500);
-        
-        // DataView slices reference the same buffer; safe as long as we don't
-        // mutate the original. Copy to own the memory:
-        
-        const g = new THREE.BufferGeometry();
-        g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-        g.setIndex(new THREE.BufferAttribute(indices, 1));
-        g.computeVertexNormals();
-        g.computeBoundingSphere();
-        setGeometry(g);
-
-      })
-      .catch((e) => console.warn(`tile ${z}/${x}/${y} failed:`, e));
-    return () => { alive = false; };
-  }, [z, x, y]);
-
-  useEffect(() => () => { geometry?.dispose(); }, [geometry]);
-
-  const world = useMemo(() => tileWorldBounds(z, x, y), [z, x, y]);
-
-  if (!geometry) return null;
-
-  return (
-    // Then in the return:
     <mesh
-      geometry={geometry}
-      position={[world.centerX, 0, world.centerZ]}
-      scale={[
-        (world.sizeX / 2) * (1 + TILE_OVERLAP),
-        1,
-        (world.sizeZ / 2) * (1 + TILE_OVERLAP),
-      ]}
+      geometry={geom}
+      onPointerMove={(e) => { e.stopPropagation(); if (onPointerMove && e.point) onPointerMove(e.point.clone()); }}
+      onPointerOut={() => onPointerOut?.()}
+      onPointerUp={(e) => {
+        e.stopPropagation();
+        if (onClick && e.point) onClick(e.point.clone());
+      }}
+      onContextMenu={(e) => {
+        e.stopPropagation();
+        if (onRightClick && (e as any).point) onRightClick((e as any).point.clone());
+      }}
     >
-      <meshStandardMaterial color="#8B7355" side={THREE.DoubleSide} />
+      {material}
     </mesh>
   );
 }
 
 
 ================================================
-FILE: src/lib/addSkirts.ts
+FILE: src/editions/community/buildings.ts
 ================================================
-// src/lib/addSkirts.ts
-export interface SkirtedGeometry {
-  positions: Float32Array;
-  indices: Uint32Array;
+// src/editions/community/buildings.ts
+export interface BuildingType {
+  id: string;
+  name: string;
+  color: string;
+  sizeX: number; // meters
+  sizeY: number;
+  sizeZ: number;
+  cost: number;
 }
 
-export function addSkirts(
-  positions: Float32Array,
-  indices: Uint32Array,
-  skirtDepth: number,
-): SkirtedGeometry {
-  const vertCount = positions.length / 3;
+export const BUILDINGS: BuildingType[] = [
+  { id: "road",    name: "Road",    color: "#404040", sizeX: 30, sizeY: 0.5, sizeZ: 30, cost: 10  },
+  { id: "house",   name: "House",   color: "#c8a47e", sizeX: 25, sizeY: 12,  sizeZ: 25, cost: 100 },
+  { id: "shop",    name: "Shop",    color: "#d29a3a", sizeX: 30, sizeY: 15,  sizeZ: 30, cost: 250 },
+  { id: "factory", name: "Factory", color: "#7d8794", sizeX: 50, sizeY: 20,  sizeZ: 40, cost: 800 },
+];
 
-  // Find actual mesh extents
-  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-  for (let i = 0; i < vertCount; i++) {
-    const x = positions[i * 3];
-    const z = positions[i * 3 + 2];
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (z < minZ) minZ = z;
-    if (z > maxZ) maxZ = z;
-  }
+export const findBuilding = (id: string) =>
+  BUILDINGS.find((b) => b.id === id);
 
-  const spanX = Math.max(maxX - minX, 1e-6);
-  const spanZ = Math.max(maxZ - minZ, 1e-6);
-  const epsX = spanX * 0.01;  // 1% tolerance
-  const epsZ = spanZ * 0.01;
 
-  const sides: { N: number[]; S: number[]; E: number[]; W: number[] } =
-    { N: [], S: [], E: [], W: [] };
+================================================
+FILE: src/editions/community/Community.tsx
+================================================
+// src/editions/community/Community.tsx
+import { useState, useEffect, useRef } from "react";
+import { Canvas } from "@react-three/fiber";
+import { OrbitControls } from "@react-three/drei";
+import { invoke } from "@tauri-apps/api/core";
+import * as THREE from "three";
+import { Terrain } from "../../core/Terrain";
+import { useDem } from "../../core/DemContext";
+import { sampleElevation, snapToGrid, worldToLonLat } from "../../core/dem";
+import { CameraHUD, CameraReporter } from "../../core/CameraHUD";
 
-  for (let i = 0; i < vertCount; i++) {
-    const x = positions[i * 3];
-    const z = positions[i * 3 + 2];
-    if (Math.abs(x - minX) < epsX) sides.W.push(i);
-    if (Math.abs(x - maxX) < epsX) sides.E.push(i);
-    if (Math.abs(z - minZ) < epsZ) sides.N.push(i);
-    if (Math.abs(z - maxZ) < epsZ) sides.S.push(i);
-  }
+import { BUILDINGS, findBuilding } from "./buildings";
+import { Ghost } from "./Ghost";   // <-- NEW import
+import { PlacedBuildings } from "./PlacedBuildings";
 
-  const extraPos: number[] = [];
-  const extraIdx: number[] = [];
+const SKY_COLOR = "#b8d4e8";
+const GRID_SIZE = 30;   // meters — 30 m matches DEM resolution
 
-  const buildSkirt = (verts: number[], sortAxis: 0 | 2) => {
-    if (verts.length < 2) return;
-    verts.sort((a, b) => positions[a * 3 + sortAxis] - positions[b * 3 + sortAxis]);
-    const base = vertCount + extraPos.length / 3;
-    for (const i of verts) {
-      extraPos.push(positions[i * 3], positions[i * 3 + 1] - skirtDepth, positions[i * 3 + 2]);
+export interface PlacedBuilding {
+  id: string;
+  typeId: string;
+  worldX: number;
+  worldZ: number;
+  elevation: number;
+  lon: number;
+  lat: number;
+  rotationY: number;
+}
+
+export function Community() {
+  const { dem } = useDem();
+  const [stride, setStride] = useState(8);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [placed, setPlaced] = useState<PlacedBuilding[]>([]);
+  const [cash, setCash] = useState(10_000);
+  const [status, setStatus] = useState<string>("");
+
+  // ghost position ref replaces old ghost state
+  const ghostPos = useRef<{ x: number; y: number; z: number; active: boolean }>({
+    x: 0, y: 0, z: 0, active: false,
+  });
+
+  const downPos = useRef<{ x: number; y: number } | null>(null);
+  const DRAG_THRESHOLD_PX = 5;
+  const [previewRotation, setPreviewRotation] = useState(0);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "r" || e.key === "R") {
+        setPreviewRotation((r) => r + Math.PI / 2);
+      }
+      if (e.key === "Escape") {
+        setSelected(null);
+        ghostPos.current.active = false;
+        setPreviewRotation(0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  useEffect(() => { setPreviewRotation(0); }, [selected]);
+
+  // ---- Terrain events ----
+  const handlePointerDown = (e: React.PointerEvent) => {
+    downPos.current = { x: e.clientX, y: e.clientY };
+  };
+
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (!downPos.current) return;
+    const dx = e.clientX - downPos.current.x;
+    const dy = e.clientY - downPos.current.y;
+    const wasDrag = Math.hypot(dx, dy) > DRAG_THRESHOLD_PX;
+    downPos.current = null;
+    if (wasDrag) ghostPos.current.active = false; // deactivate ghost if drag
+  };
+
+  const handlePointerMove = (world: THREE.Vector3) => {
+    if (!dem || !selected) { ghostPos.current.active = false; return; }
+    const x = snapToGrid(world.x, GRID_SIZE);
+    const z = snapToGrid(world.z, GRID_SIZE);
+    const y = sampleElevation(dem, x, z);
+    ghostPos.current.x = x;
+    ghostPos.current.y = y;
+    ghostPos.current.z = z;
+    ghostPos.current.active = true;
+  };
+
+  const handlePointerOut = () => { ghostPos.current.active = false; };
+
+  const handleClick = (world: THREE.Vector3) => {
+    if (!dem || !selected) return;
+    const def = findBuilding(selected);
+    if (!def) return;
+    if (cash < def.cost) { setStatus(`Not enough cash for ${def.name}`); return; }
+
+    const x = snapToGrid(world.x, GRID_SIZE);
+    const z = snapToGrid(world.z, GRID_SIZE);
+    const y = sampleElevation(dem, x, z);
+    const { lon, lat } = worldToLonLat(dem.bounds, x, z);
+
+    setPlaced((p) => [
+      ...p,
+      { id: crypto.randomUUID(), typeId: def.id, worldX: x, worldZ: z, elevation: y, lon, lat, rotationY: previewRotation },
+    ]);
+    setCash((c) => c - def.cost);
+    setStatus(`Placed ${def.name} at (${x.toFixed(0)}, ${z.toFixed(0)})`);
+  };
+
+  const handleRightClick = (world: THREE.Vector3) => {
+    const RADIUS = 30;
+    let nearestIdx = -1;
+    let nearestDist = RADIUS * RADIUS;
+    for (let i = 0; i < placed.length; i++) {
+      const b = placed[i];
+      const dx = b.worldX - world.x;
+      const dz = b.worldZ - world.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < nearestDist) { nearestDist = d2; nearestIdx = i; }
     }
-    for (let i = 0; i < verts.length - 1; i++) {
-      const a = verts[i], b = verts[i + 1];
-      const c = base + i, d = base + i + 1;
-      extraIdx.push(a, c, b);
-      extraIdx.push(b, c, d);
+    if (nearestIdx < 0) { setStatus("No building nearby to delete."); return; }
+    const removed = placed[nearestIdx];
+    const def = findBuilding(removed.typeId);
+    setPlaced((p) => p.filter((_, i) => i !== nearestIdx));
+    if (def) setCash((c) => c + Math.round(def.cost * 0.5));
+    setStatus(`Removed ${def?.name ?? "building"} (+$${Math.round((def?.cost ?? 0) * 0.5)})`);
+  };
+
+  // ---- Persistence ----
+  const saveCity = async () => {
+    const payload = JSON.stringify({ version: 1, cash, buildings: placed });
+    try {
+      await invoke("save_city", { json: payload });
+      setStatus(`Saved ${placed.length} buildings.`);
+    } catch (e) {
+      setStatus(`Save failed: ${e}`);
     }
   };
 
-  buildSkirt(sides.N, 0);
-  buildSkirt(sides.S, 0);
-  buildSkirt(sides.E, 2);
-  buildSkirt(sides.W, 2);
-
-  const outPos = new Float32Array(positions.length + extraPos.length);
-  outPos.set(positions);
-  outPos.set(extraPos, positions.length);
-
-  const outIdx = new Uint32Array(indices.length + extraIdx.length);
-  outIdx.set(indices);
-  outIdx.set(extraIdx, indices.length);
-
-  return { positions: outPos, indices: outIdx };
-}
-
-
-================================================
-FILE: src/lib/quantizedMesh.ts
-================================================
-// src/lib/quantizedMesh.ts
-// Minimal decoder for Cesium quantized-mesh-1.0.
-// Returns positions (Float32Array, xyz) and indices (Uint32Array).
-
-export interface DecodedMesh {
-  positions: Float32Array; // xyz interleaved, centered at (0,0,0)
-  indices: Uint32Array;
-  minHeight: number;
-  maxHeight: number;
-  center: [number, number, number];
-}
-
-const MAGIC = "quantized-mesh-1.0";
-
-function readMagic(view: DataView): string {
-  let s = "";
-  for (let i = 0; i < 24; i++) {
-    const c = view.getUint8(i);
-    if (c === 0) break;
-    s += String.fromCharCode(c);
-  }
-  return s;
-}
-
-const zigZag = (v: number) => (v >> 1) ^ (-(v & 1));
-
-export function decodeQuantizedMesh(buffer: ArrayBufferLike): DecodedMesh {
-  const view = new DataView(buffer);
-  const magic = readMagic(view);
-  if (magic !== MAGIC) throw new Error(`Bad magic: "${magic}"`);
-
-  let offset = 24;
-  const version = view.getUint32(offset, true); offset += 4;
-  if (version !== 1) throw new Error(`Unsupported version ${version}`);
-
-  const vertexCount = view.getUint32(offset, true); offset += 4;
-  const triangleCount = view.getUint32(offset, true); offset += 4;
-
-  // Header (unchanged from spec):
-  const centerX = view.getFloat64(offset, true); offset += 8;
-  const centerY = view.getFloat64(offset, true); offset += 8;
-  const centerZ = view.getFloat64(offset, true); offset += 8;
-  const minHeight = view.getFloat32(offset, true); offset += 4;
-  const maxHeight = view.getFloat32(offset, true); offset += 4;
-
-  // Skip bounding sphere (center[3] + radius) = 32 bytes
-  offset += 32;
-  // Skip horizon occlusion point (3 doubles) = 24 bytes
-  offset += 24;
-
-  // ----- Vertex data -----
-  // u, v, height arrays — each u16, delta + zigzag encoded
-  const u = new Uint16Array(buffer, offset, vertexCount);
-  offset += vertexCount * 2;
-  const v = new Uint16Array(buffer, offset, vertexCount);
-  offset += vertexCount * 2;
-  const h = new Uint16Array(buffer, offset, vertexCount);
-  offset += vertexCount * 2;
-
-  const uu = new Uint16Array(vertexCount);
-  const vv = new Uint16Array(vertexCount);
-  const hh = new Uint16Array(vertexCount);
-
-  let uSum = 0, vSum = 0, hSum = 0;
-  for (let i = 0; i < vertexCount; i++) {
-    uSum += zigZag(u[i]); uu[i] = uSum & 0xffff;
-    vSum += zigZag(v[i]); vv[i] = vSum & 0xffff;
-    hSum += zigZag(h[i]); hh[i] = hSum & 0xffff;
-  }
-
-  // ----- Index data -----
-  // High-water-mark decode. uint16 if vertexCount < 65536, else uint32.
-  const use32 = vertexCount > 65536;
-  const rawIndexCount = triangleCount * 3;
-  let rawIndices: Uint16Array | Uint32Array;
-
-  if (use32) {
-    // Align to 4 bytes
-    if (offset % 4 !== 0) offset += 4 - (offset % 4);
-    rawIndices = new Uint32Array(buffer, offset, rawIndexCount);
-    offset += rawIndexCount * 4;
-  } else {
-    rawIndices = new Uint16Array(buffer, offset, rawIndexCount);
-    offset += rawIndexCount * 2;
-  }
-
-  const indices = new Uint32Array(rawIndexCount);
-  let highest = 0;
-  for (let i = 0; i < rawIndexCount; i++) {
-    const code = rawIndices[i];
-    indices[i] = highest - code;
-    if (code === 0) highest++;
-  }
-
-  // ----- Build positions -----
-  // Quantized u,v map [0,65535] -> [0,1] across the tile.
-  // Heights map [0,32767] -> [minHeight, maxHeight].
-  // We normalize to a [-1,1] x [-1,1] x [h0,h1] box for simplicity.
-  const positions = new Float32Array(vertexCount * 3);
-  const heightRange = maxHeight - minHeight;
-  for (let i = 0; i < vertexCount; i++) {
-    const x = (uu[i] / 65535) * 2 - 1;
-    const y = (vv[i] / 65535) * 2 - 1;
-    const z = minHeight + (hh[i] / 32767) * heightRange;
-    positions[i * 3 + 0] = x;
-    positions[i * 3 + 1] = z; // scale down meters for scene
-    positions[i * 3 + 2] = y;
-  }
-
-  return {
-    positions,
-    indices,
-    minHeight,
-    maxHeight,
-    center: [centerX, centerY, centerZ],
+  const loadCity = async () => {
+    try {
+      const raw = await invoke<string | null>("load_city");
+      if (!raw) { setStatus("No saved city found."); return; }
+      const data = JSON.parse(raw);
+      setPlaced(data.buildings ?? []);
+      setCash(data.cash ?? 10_000);
+      setStatus(`Loaded ${data.buildings?.length ?? 0} buildings.`);
+    } catch (e) {
+      setStatus(`Load failed: ${e}`);
+    }
   };
-}
 
-
-================================================
-FILE: src/lib/tileMath.ts
-================================================
-// src/lib/tileMath.ts
-// Local ENU (East-North-Up) frame centered on the valley.
-// Three.js convention: X = east, Y = up (elevation), Z = -north (so camera looking -Z faces north).
-
-export const VALLEY_CENTER_LON = 93.5;   // was 94.0
-export const VALLEY_CENTER_LAT = 24.5;   // was 25.0
-
-const METERS_PER_DEG_LAT = 110_540;
-export function metersPerDegLon(latDeg: number): number {
-  return 111_320 * Math.cos((latDeg * Math.PI) / 180);
-}
-
-export interface LonLatBounds { west: number; south: number; east: number; north: number; }
-
-/**
- * Cesium geodetic TMS (GeographicTilingScheme):
- *   level 0 = 2 tiles in X (180° lon each) × 1 tile in Y (180° lat each)
- *   level z = 2^(z+1) tiles in X, 2^z tiles in Y
- *   → lonSpan = latSpan = 180 / 2^z
- */
-export function tileBounds(z: number, x: number, y: number): LonLatBounds {
-  const lonSpan = 180 / 2 ** z;
-  const latSpan = 180 / 2 ** z;
-  const west = -180 + x * lonSpan;
-  const south = -90 + y * latSpan;
-  return { west, south, east: west + lonSpan, north: south + latSpan };
-}
-
-export interface WorldBounds {
-  west: number; east: number;
-  north: number; south: number;
-  centerX: number; centerZ: number;
-  sizeX: number; sizeZ: number;
-}
-
-/** Convert a TMS tile to world-space AABB in meters. */
-export function tileWorldBounds(z: number, x: number, y: number): WorldBounds {
-  const b = tileBounds(z, x, y);
-  const mLon = metersPerDegLon((b.north + b.south) / 2);
-
-  const west  = (b.west  - VALLEY_CENTER_LON) * mLon;
-  const east  = (b.east  - VALLEY_CENTER_LON) * mLon;
-  // Y-up, right-handed: north is -Z
-  const north = -(b.north - VALLEY_CENTER_LAT) * METERS_PER_DEG_LAT;
-  const south = -(b.south - VALLEY_CENTER_LAT) * METERS_PER_DEG_LAT;
-
-  return {
-    west, east, north, south,
-    centerX: (west + east) / 2,
-    centerZ: (north + south) / 2,
-    sizeX: east - west,
-    sizeZ: south - north, // positive
+  const clearCity = () => {
+    if (!confirm("Clear all buildings?")) return;
+    setPlaced([]);
+    setStatus("City cleared.");
   };
+
+  return (
+    <div
+      style={{ width: "100vw", height: "100vh", position: "relative" }}
+      onPointerDown={handlePointerDown}
+      onPointerUp={handlePointerUp}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {/* ---- HUD ---- */}
+      <div style={hudStyle}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Community Edition</div>
+        <div style={{ marginBottom: 8, fontSize: 12 }}>
+          Cash: <b>${cash.toLocaleString()}</b> · Buildings: <b>{placed.length}</b>
+        </div>
+
+        <div style={{ marginBottom: 8, fontSize: 12 }}>Build:</div>
+        {BUILDINGS.map((b) => (
+          <button
+            key={b.id}
+            onClick={() => setSelected(selected === b.id ? null : b.id)}
+            style={{
+              display: "block", width: "100%", textAlign: "left",
+              marginBottom: 4, padding: "4px 8px",
+              background: selected === b.id ? b.color : "#f3f3f3",
+              color: selected === b.id ? "#fff" : "#111",
+              border: "1px solid #ccc", borderRadius: 4,
+            }}
+          >
+            {b.name} — ${b.cost}
+          </button>
+        ))}
+
+        <hr style={{ margin: "10px 0" }} />
+
+        <button onClick={saveCity} style={btnStyle}>Save</button>
+        <button onClick={loadCity} style={btnStyle}>Load</button>
+        <button onClick={clearCity} style={btnStyle}>Clear</button>
+
+        <hr style={{ margin: "10px 0" }} />
+
+        <div style={{ fontSize: 11, color: "#555" }}>
+          Stride:&nbsp;
+          <select value={stride} onChange={(e) => setStride(Number(e.target.value))}>
+            <option value={16}>16</option>
+            <option value={8}>8</option>
+            <option value={4}>4</option>
+            <option value={2}>2</option>
+          </select>
+        </div>
+
+        {status && (
+          <div style={{ marginTop: 8, fontSize: 11, color: "#333" }}>{status}</div>
+        )}
+      </div>
+
+      {/* NEW: camera altitude HUD (bottom-left) */}
+      <CameraHUD
+        groundElevation={
+          dem ? sampleElevation(dem, 0, 0) : null   // valley-center reference
+        }
+      />
+
+      {/* ---- 3D scene ---- */}
+      <Canvas
+        camera={{ position: [0, 8000, 8000], fov: 45, near: 10, far: 120_000 }}
+        onCreated={({ scene }) => {
+          scene.background = new THREE.Color(SKY_COLOR);
+          scene.fog = new THREE.Fog(SKY_COLOR, 40_000, 100_000);
+        }}
+      >
+        <CameraReporter /> 
+        <ambientLight intensity={1.0} />
+        <directionalLight position={[20_000, 30_000, 20_000]} intensity={0.4} />
+        <Terrain
+          stride={stride}
+          onPointerMove={handlePointerMove}
+          onPointerOut={handlePointerOut}
+          onClick={handleClick}
+          onRightClick={handleRightClick}
+        />
+
+        {/* Placed buildings */}
+        {placed.map((p) => {
+          const def = findBuilding(p.typeId);
+          if (!def) return null;
+          return (
+            <mesh key={p.id} position={[p.worldX, p.elevation + def.sizeY / 2, p.worldZ]} rotation={[0, p.rotationY, 0]}>
+              <boxGeometry args={[def.sizeX, def.sizeY, def.sizeZ]} />
+              <meshStandardMaterial color={def.color} />
+            </mesh>
+          );
+        })}
+
+        {/* Placed buildings */}
+        <PlacedBuildings placed={placed} />
+
+        {/* Ghost preview via Ghost component */}
+        <Ghost posRef={ghostPos} typeId={selected} rotationY={previewRotation} />
+
+        <OrbitControls
+          target={[0, 800, 0]}
+          maxPolarAngle={Math.PI / 2.15}
+          minDistance={100}
+          maxDistance={80_000}
+        />
+      </Canvas>
+    </div>
+  );
 }
+
+// ---- inline styles ----
+const hudStyle: React.CSSProperties = {
+  position: "absolute", top: 12, left: 12, zIndex: 10,
+  background: "#fff", padding: 12, borderRadius: 6,
+  fontFamily: "system-ui, sans-serif", fontSize: 13,
+  width: 180, boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+};
+
+const btnStyle: React.CSSProperties = {
+  display: "block", width: "100%", marginBottom: 4,
+  padding: "4px 8px", fontSize: 12, cursor: "pointer",
+};
+
+
+================================================
+FILE: src/editions/community/Ghost.tsx
+================================================
+// src/editions/community/Ghost.tsx
+import { useRef, useMemo } from "react";
+import { useFrame } from "@react-three/fiber";
+import * as THREE from "three";
+import { findBuilding } from "./buildings";
+
+interface Props {
+  posRef: React.MutableRefObject<{ x: number; y: number; z: number; active: boolean }>;
+  typeId: string | null;
+  rotationY: number;
+}
+
+export function Ghost({ posRef, typeId, rotationY }: Props) {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const def = typeId ? findBuilding(typeId) : null;
+
+  useFrame(() => {
+    const m = meshRef.current;
+    if (!m || !def) return;
+    const p = posRef.current;
+    if (!p.active) { m.visible = false; return; }
+    m.visible = true;
+    m.position.set(p.x, p.y + def.sizeY / 2, p.z);
+    m.rotation.y = rotationY;
+  });
+
+  if (!def) return null;
+
+  return (
+    <mesh ref={meshRef} visible={false}>
+      <boxGeometry args={[def.sizeX, def.sizeY, def.sizeZ]} />
+      <meshStandardMaterial
+        color={def.color}
+        transparent
+        opacity={0.5}
+        depthWrite={false}
+      />
+    </mesh>
+  );
+}
+
+
+================================================
+FILE: src/editions/community/PlacedBuildings.tsx
+================================================
+// src/editions/community/PlacedBuildings.tsx
+import React from "react";
+import { findBuilding } from "./buildings";
+import type { PlacedBuilding } from "./Community";
+
+export const PlacedBuildings = React.memo(function PlacedBuildings({
+  placed,
+}: {
+  placed: PlacedBuilding[];
+}) {
+  return (
+    <>
+      {placed.map((p) => {
+        const def = findBuilding(p.typeId);
+        if (!def) return null;
+        return (
+          <mesh
+            key={p.id}
+            position={[p.worldX, p.elevation + def.sizeY / 2, p.worldZ]}
+            rotation={[0, p.rotationY, 0]}
+          >
+            <boxGeometry args={[def.sizeX, def.sizeY, def.sizeZ]} />
+            <meshStandardMaterial color={def.color} />
+          </mesh>
+        );
+      })}
+    </>
+  );
+});
 
 
 ================================================
@@ -966,8 +1457,6 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 flate2 = "1"
-quantized-mesh = "0.3.0"
-georaster = "0.2.0"
 tiff = "0.9"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -1009,7 +1498,8 @@ FILE: src-tauri/tauri.conf.json
   "bundle": {
     "active": true,
     "resources": [
-        "resources/dem/imphal_full.tif"
+        "resources/dem/imphal_full.tif",
+        "resources/dem/imphal_texture.jpg"
       ],
     "targets": "all",
     "icon": [
@@ -1064,10 +1554,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             terrain::load_dem_mesh,
-            // terrain::get_terrain_tile,
-            // terrain::get_terrain_tile_mesh,
-            // terrain::get_tileset,
-            // terrain::list_tiles
+            terrain::load_terrain_texture,
+            terrain::save_city,
+            terrain::load_city,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1090,14 +1579,12 @@ fn main() {
 ================================================
 FILE: src-tauri/src/terrain.rs
 ================================================
-use georaster::geotiff::{GeoTiffReader, RasterValue};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Mutex;
 use tauri::ipc::Response;
 use tauri::{AppHandle, Manager};
 
-// ---- Cached full-resolution DEM ----
 pub struct DemData {
     pub width: u32,
     pub height: u32,
@@ -1105,7 +1592,7 @@ pub struct DemData {
     pub south: f64,
     pub east: f64,
     pub north: f64,
-    pub heights: Vec<f32>, // row-major, north → south
+    pub heights: Vec<f32>,
 }
 
 pub struct DemCache(pub Mutex<Option<DemData>>);
@@ -1120,7 +1607,6 @@ fn read_full_dem(path: &std::path::Path) -> Result<DemData, String> {
     let file = File::open(path).map_err(|e| format!("open {:?}: {}", path, e))?;
     let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))
         .map_err(|e| format!("tiff decoder: {}", e))?;
-
     let (w, h) = decoder.dimensions().map_err(|e| format!("dims: {}", e))?;
     let img = decoder
         .read_image()
@@ -1138,7 +1624,6 @@ fn read_full_dem(path: &std::path::Path) -> Result<DemData, String> {
         _ => return Err("unsupported pixel format".to_string()),
     };
 
-    // From gdalinfo: Origin=(92.9998611, 25.0001389), PixelSize=0.0002777...
     let west = 92.9998611_f64;
     let north = 25.0001389_f64;
     let px_size = 0.000277777777778_f64;
@@ -1162,7 +1647,6 @@ pub async fn load_dem_mesh(
     cache: tauri::State<'_, DemCache>,
     stride: u32,
 ) -> Result<Response, String> {
-    // ---- Ensure the full-res DEM is loaded once ----
     let needs_load = cache.0.lock().unwrap().is_none();
     if needs_load {
         let path = app
@@ -1186,14 +1670,11 @@ pub async fn load_dem_mesh(
             (dem.width as f64 * dem.height as f64) / 1e6,
             (dem.heights.len() * 4) as f64 / 1e6,
         );
-
         *cache.0.lock().unwrap() = Some(dem);
     }
 
-    // ---- Subsample and serialize ----
     let guard = cache.0.lock().unwrap();
     let dem = guard.as_ref().unwrap();
-
     let stride = stride.max(1) as usize;
     let out_w = (dem.width as usize + stride - 1) / stride;
     let out_h = (dem.height as usize + stride - 1) / stride;
@@ -1227,6 +1708,56 @@ pub async fn load_dem_mesh(
     );
 
     Ok(Response::new(out))
+}
+
+// ---- Persistence ----
+
+fn city_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {}", e))?;
+    Ok(dir.join("city.json"))
+}
+
+#[tauri::command]
+pub async fn save_city(app: AppHandle, json: String) -> Result<(), String> {
+    let path = city_path(&app)?;
+    std::fs::write(&path, json).map_err(|e| format!("write {:?}: {}", path, e))?;
+    println!("[city] saved to {:?}", path);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn load_city(app: AppHandle) -> Result<Option<String>, String> {
+    let path = city_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let s = std::fs::read_to_string(&path).map_err(|e| format!("read: {}", e))?;
+    println!("[city] loaded from {:?}", path);
+    Ok(Some(s))
+}
+
+#[tauri::command]
+pub async fn load_terrain_texture(app: AppHandle) -> Result<Response, String> {
+    let path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir: {}", e))?
+        .join("resources")
+        .join("dem")
+        .join("imphal_texture.jpg");
+
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+
+    println!(
+        "[dem] texture loaded: {} bytes from {:?}",
+        bytes.len(),
+        path
+    );
+    Ok(Response::new(bytes))
 }
 
 

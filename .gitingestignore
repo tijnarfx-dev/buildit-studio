@@ -1,2 +1,6 @@
 src-tauri/resources/terrain/
 resources/terrain/
+src-tauri/resources/dem/
+resources/dem/
+src-tauri/resources/osm/
+resources/osm/

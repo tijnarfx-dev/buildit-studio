@@ -23,6 +23,10 @@ dist-ssr
 *.sln
 *.sw?
 
-# Ignore terrain folder and its contents
+# Ignore resources folder and its contents
+src-tauri/resources/
+resources/
 src-tauri/resources/dem/
 resources/dem/
+src-tauri/resources/osm/
+resources/osm/

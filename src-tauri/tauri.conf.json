@@ -24,7 +24,10 @@
   "bundle": {
     "active": true,
     "resources": [
-        "resources/dem/imphal_full.tif"
+        "resources/dem/imphal_full.tif",
+        "resources/dem/imphal_texture.jpg",
+        "resources/osm/imphal_osm.geojson",
+        "resources/osm/imphal_osm.meta.json"
       ],
     "targets": "all",
     "icon": [

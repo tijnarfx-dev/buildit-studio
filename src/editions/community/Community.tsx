@@ -7,6 +7,13 @@ import * as THREE from "three";
 import { Terrain } from "../../core/Terrain";
 import { useDem } from "../../core/DemContext";
 import { sampleElevation, snapToGrid, worldToLonLat } from "../../core/dem";
+import { CameraHUD, CameraReporter, CompassRose } from "../../core/CameraHUD";
+import { OsmOverlay } from "../../core/OsmOverlay";
+import { GridRings } from "../../core/GridRings";
+import { CursorHUD } from "../../core/CursorHUD";
+import { cursorStore } from "../../core/hudStores";
+
+
 import { BUILDINGS, findBuilding } from "./buildings";
 import { Ghost } from "./Ghost";   // <-- NEW import
 import { PlacedBuildings } from "./PlacedBuildings";
@@ -25,6 +32,16 @@ export interface PlacedBuilding {
   rotationY: number;
 }
 
+function slopeDegAt(dem: import("../../core/dem").DemData, x: number, z: number, step = 30) {
+  const hL = sampleElevation(dem, x - step, z);
+  const hR = sampleElevation(dem, x + step, z);
+  const hD = sampleElevation(dem, x, z - step);
+  const hU = sampleElevation(dem, x, z + step);
+  const dzdx = (hR - hL) / (2 * step);
+  const dzdz = (hU - hD) / (2 * step);
+  return THREE.MathUtils.radToDeg(Math.atan(Math.hypot(dzdx, dzdz)));
+}
+
 export function Community() {
   const { dem } = useDem();
   const [stride, setStride] = useState(8);
@@ -32,6 +49,11 @@ export function Community() {
   const [placed, setPlaced] = useState<PlacedBuilding[]>([]);
   const [cash, setCash] = useState(10_000);
   const [status, setStatus] = useState<string>("");
+
+  const [showRoads, setShowRoads] = useState(true);
+  const [showWater, setShowWater] = useState(true);
+  const [showRail,  setShowRail]  = useState(false);
+  const [showRings, setShowRings] = useState(true);
 
   // ghost position ref replaces old ghost state
   const ghostPos = useRef<{ x: number; y: number; z: number; active: boolean }>({
@@ -73,18 +95,48 @@ export function Community() {
     if (wasDrag) ghostPos.current.active = false; // deactivate ghost if drag
   };
 
+  // const handlePointerMove = (world: THREE.Vector3) => {
+  //   if (!dem || !selected) { ghostPos.current.active = false; return; }
+  //   const x = snapToGrid(world.x, GRID_SIZE);
+  //   const z = snapToGrid(world.z, GRID_SIZE);
+  //   const y = sampleElevation(dem, x, z);
+  //   ghostPos.current.x = x;
+  //   ghostPos.current.y = y;
+  //   ghostPos.current.z = z;
+  //   ghostPos.current.active = true;
+  // };
   const handlePointerMove = (world: THREE.Vector3) => {
-    if (!dem || !selected) { ghostPos.current.active = false; return; }
-    const x = snapToGrid(world.x, GRID_SIZE);
-    const z = snapToGrid(world.z, GRID_SIZE);
-    const y = sampleElevation(dem, x, z);
-    ghostPos.current.x = x;
-    ghostPos.current.y = y;
-    ghostPos.current.z = z;
-    ghostPos.current.active = true;
+    if (!dem) return;
+
+    const snappedX = snapToGrid(world.x, GRID_SIZE);
+    const snappedZ = snapToGrid(world.z, GRID_SIZE);
+    const y = sampleElevation(dem, snappedX, snappedZ);
+    const { lon, lat } = worldToLonLat(dem.bounds, world.x, world.z);
+
+    cursorStore.set({
+      active: true,
+      x: world.x,
+      z: world.z,
+      elevation: y,
+      lon,
+      lat,
+      slopeDeg: slopeDegAt(dem, world.x, world.z),
+    });
+
+    if (selected) {
+      ghostPos.current.x = snappedX;
+      ghostPos.current.y = y;
+      ghostPos.current.z = snappedZ;
+      ghostPos.current.active = true;
+    } else {
+      ghostPos.current.active = false;
+    }
   };
 
-  const handlePointerOut = () => { ghostPos.current.active = false; };
+  const handlePointerOut = () => {
+    ghostPos.current.active = false;
+    cursorStore.set({ ...cursorStore.value, active: false });
+  };
 
   const handleClick = (world: THREE.Vector3) => {
     if (!dem || !selected) return;
@@ -203,21 +255,55 @@ export function Community() {
           </select>
         </div>
 
+        <hr style={{ margin: "10px 0" }} />
+          <div style={{ fontSize: 12, marginBottom: 4 }}>Overlays:</div>
+          <label style={cbRowStyle}>
+            <input type="checkbox" checked={showRoads} onChange={(e) => setShowRoads(e.target.checked)} />
+            Roads
+          </label>
+          <label style={cbRowStyle}>
+            <input type="checkbox" checked={showWater} onChange={(e) => setShowWater(e.target.checked)} />
+            Rivers
+          </label>
+          <label style={cbRowStyle}>
+            <input type="checkbox" checked={showRail} onChange={(e) => setShowRail(e.target.checked)} />
+            Railways
+          </label>
+
+        <label style={cbRowStyle}>
+          <input
+            type="checkbox"
+            checked={showRings}
+            onChange={(e) => setShowRings(e.target.checked)}
+          />
+          Distance rings
+        </label>
+
         {status && (
           <div style={{ marginTop: 8, fontSize: 11, color: "#333" }}>{status}</div>
         )}
       </div>
+
+      {/* NEW: camera altitude HUD (bottom-left) */}
+      <CameraHUD
+        groundElevation={
+          dem ? sampleElevation(dem, 0, 0) : null   // valley-center reference
+        }
+      />
+      <CursorHUD />
+      <CompassRose />
 
       {/* ---- 3D scene ---- */}
       <Canvas
         camera={{ position: [0, 8000, 8000], fov: 45, near: 10, far: 120_000 }}
         onCreated={({ scene }) => {
           scene.background = new THREE.Color(SKY_COLOR);
-          scene.fog = new THREE.Fog(SKY_COLOR, 30_000, 90_000);
+          scene.fog = new THREE.Fog(SKY_COLOR, 40_000, 100_000);
         }}
       >
-        <ambientLight intensity={0.7} />
-        <directionalLight position={[20_000, 30_000, 20_000]} intensity={1.2} />
+        <CameraReporter /> 
+        <ambientLight intensity={1.0} />
+        <directionalLight position={[20_000, 30_000, 20_000]} intensity={0.4} />
         <Terrain
           stride={stride}
           onPointerMove={handlePointerMove}
@@ -225,18 +311,8 @@ export function Community() {
           onClick={handleClick}
           onRightClick={handleRightClick}
         />
-
-        {/* Placed buildings */}
-        {placed.map((p) => {
-          const def = findBuilding(p.typeId);
-          if (!def) return null;
-          return (
-            <mesh key={p.id} position={[p.worldX, p.elevation + def.sizeY / 2, p.worldZ]} rotation={[0, p.rotationY, 0]}>
-              <boxGeometry args={[def.sizeX, def.sizeY, def.sizeZ]} />
-              <meshStandardMaterial color={def.color} />
-            </mesh>
-          );
-        })}
+        <GridRings visible={showRings} />
+        <OsmOverlay visible={{ roads: showRoads, water: showWater, rail: showRail }} />
 
         {/* Placed buildings */}
         <PlacedBuildings placed={placed} />
@@ -245,6 +321,7 @@ export function Community() {
         <Ghost posRef={ghostPos} typeId={selected} rotationY={previewRotation} />
 
         <OrbitControls
+          makeDefault
           target={[0, 800, 0]}
           maxPolarAngle={Math.PI / 2.15}
           minDistance={100}
@@ -266,4 +343,9 @@ const hudStyle: React.CSSProperties = {
 const btnStyle: React.CSSProperties = {
   display: "block", width: "100%", marginBottom: 4,
   padding: "4px 8px", fontSize: 12, cursor: "pointer",
+};
+
+const cbRowStyle: React.CSSProperties = {
+  display: "flex", alignItems: "center", gap: 6,
+  fontSize: 12, padding: "2px 0", cursor: "pointer",
 };

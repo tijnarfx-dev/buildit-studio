@@ -1,4 +1,5 @@
-mod terrain;
+mod osm;
+mod terrain; // <-- ADD
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -13,8 +14,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             terrain::load_dem_mesh,
+            terrain::load_terrain_texture,
             terrain::save_city,
             terrain::load_city,
+            osm::load_osm_geojson,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

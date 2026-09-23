@@ -158,3 +158,23 @@ pub async fn load_city(app: AppHandle) -> Result<Option<String>, String> {
     println!("[city] loaded from {:?}", path);
     Ok(Some(s))
 }
+
+#[tauri::command]
+pub async fn load_terrain_texture(app: AppHandle) -> Result<Response, String> {
+    let path = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir: {}", e))?
+        .join("resources")
+        .join("dem")
+        .join("imphal_texture.jpg");
+
+    let bytes = std::fs::read(&path).map_err(|e| format!("read {:?}: {}", path, e))?;
+
+    println!(
+        "[dem] texture loaded: {} bytes from {:?}",
+        bytes.len(),
+        path
+    );
+    Ok(Response::new(bytes))
+}
