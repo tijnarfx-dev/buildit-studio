@@ -13,10 +13,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             greet,
             terrain::load_dem_mesh,
-            // terrain::get_terrain_tile,
-            // terrain::get_terrain_tile_mesh,
-            // terrain::get_tileset,
-            // terrain::list_tiles
+            terrain::save_city,
+            terrain::load_city,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

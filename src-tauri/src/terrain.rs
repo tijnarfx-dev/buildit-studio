@@ -1,11 +1,9 @@
-use georaster::geotiff::{GeoTiffReader, RasterValue};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Mutex;
 use tauri::ipc::Response;
 use tauri::{AppHandle, Manager};
 
-// ---- Cached full-resolution DEM ----
 pub struct DemData {
     pub width: u32,
     pub height: u32,
@@ -13,7 +11,7 @@ pub struct DemData {
     pub south: f64,
     pub east: f64,
     pub north: f64,
-    pub heights: Vec<f32>, // row-major, north → south
+    pub heights: Vec<f32>,
 }
 
 pub struct DemCache(pub Mutex<Option<DemData>>);
@@ -28,7 +26,6 @@ fn read_full_dem(path: &std::path::Path) -> Result<DemData, String> {
     let file = File::open(path).map_err(|e| format!("open {:?}: {}", path, e))?;
     let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file))
         .map_err(|e| format!("tiff decoder: {}", e))?;
-
     let (w, h) = decoder.dimensions().map_err(|e| format!("dims: {}", e))?;
     let img = decoder
         .read_image()
@@ -46,7 +43,6 @@ fn read_full_dem(path: &std::path::Path) -> Result<DemData, String> {
         _ => return Err("unsupported pixel format".to_string()),
     };
 
-    // From gdalinfo: Origin=(92.9998611, 25.0001389), PixelSize=0.0002777...
     let west = 92.9998611_f64;
     let north = 25.0001389_f64;
     let px_size = 0.000277777777778_f64;
@@ -70,7 +66,6 @@ pub async fn load_dem_mesh(
     cache: tauri::State<'_, DemCache>,
     stride: u32,
 ) -> Result<Response, String> {
-    // ---- Ensure the full-res DEM is loaded once ----
     let needs_load = cache.0.lock().unwrap().is_none();
     if needs_load {
         let path = app
@@ -94,14 +89,11 @@ pub async fn load_dem_mesh(
             (dem.width as f64 * dem.height as f64) / 1e6,
             (dem.heights.len() * 4) as f64 / 1e6,
         );
-
         *cache.0.lock().unwrap() = Some(dem);
     }
 
-    // ---- Subsample and serialize ----
     let guard = cache.0.lock().unwrap();
     let dem = guard.as_ref().unwrap();
-
     let stride = stride.max(1) as usize;
     let out_w = (dem.width as usize + stride - 1) / stride;
     let out_h = (dem.height as usize + stride - 1) / stride;
@@ -135,4 +127,34 @@ pub async fn load_dem_mesh(
     );
 
     Ok(Response::new(out))
+}
+
+// ---- Persistence ----
+
+fn city_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("app_data_dir: {}", e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {}", e))?;
+    Ok(dir.join("city.json"))
+}
+
+#[tauri::command]
+pub async fn save_city(app: AppHandle, json: String) -> Result<(), String> {
+    let path = city_path(&app)?;
+    std::fs::write(&path, json).map_err(|e| format!("write {:?}: {}", path, e))?;
+    println!("[city] saved to {:?}", path);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn load_city(app: AppHandle) -> Result<Option<String>, String> {
+    let path = city_path(&app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let s = std::fs::read_to_string(&path).map_err(|e| format!("read: {}", e))?;
+    println!("[city] loaded from {:?}", path);
+    Ok(Some(s))
 }
